@@ -1,0 +1,16 @@
+services:
+  lrcget:
+    build:
+      context: .
+    container_name: ${LRCGET_CONTAINER_NAME:-lrcget}
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      - TZ=${TZ:-UTC}
+      - LRCGET_CONCURRENCY=${LRCGET_CONCURRENCY:-8}
+      - LRCGET_CLEAN_FALLBACK=${LRCGET_CLEAN_FALLBACK:-true}
+      - LRCGET_RETRY_NOT_FOUND_DAYS=${LRCGET_RETRY_NOT_FOUND_DAYS:-7}
+    volumes:
+      - ${LRCGET_CONFIG_DIR:-./config}:/config
+      - ${LRCGET_MUSIC_DIR:-./music}:/music
+    restart: unless-stopped
+
