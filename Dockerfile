@@ -1,11 +1,16 @@
-FROM python:3.13-slim
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+RUN cargo build --release --locked || cargo build --release
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+FROM debian:bookworm-slim
 
-COPY sync_lyrics.py .
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-CMD ["python", "-u", "sync_lyrics.py"]
+COPY --from=builder /app/target/release/lrcget-cli /usr/local/bin/lrcget-cli
 
+CMD ["lrcget-cli"]
