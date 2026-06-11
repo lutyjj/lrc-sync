@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,31 +14,21 @@ use crate::tags::TrackTags;
 
 #[derive(Clone)]
 pub struct CacheDb {
-    path: Arc<PathBuf>,
-    lock: Arc<Mutex<()>>,
+    db_path: Arc<PathBuf>,
+    conn: Arc<Mutex<Connection>>,
     not_found: Arc<RwLock<HashSet<String>>>,
     success: Arc<RwLock<HashSet<String>>>,
     retry_not_found_days: u64,
 }
 
 impl CacheDb {
-    pub fn new(path: PathBuf, retry_not_found_days: u64) -> Self {
-        Self {
-            path: Arc::new(path),
-            lock: Arc::new(Mutex::new(())),
-            not_found: Arc::new(RwLock::new(HashSet::new())),
-            success: Arc::new(RwLock::new(HashSet::new())),
-            retry_not_found_days,
-        }
-    }
-
-    pub fn init(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+    pub fn open(path: PathBuf, retry_not_found_days: u64) -> Result<Self> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
 
-        let _guard = self.lock.lock().expect("db lock poisoned");
-        let conn = self.open()?;
+        let conn = Connection::open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS track_cache (
@@ -73,11 +63,19 @@ impl CacheDb {
                 conn.execute(ddl, [])?;
             }
         }
-        Ok(())
+        drop(stmt);
+
+        Ok(Self {
+            db_path: Arc::new(path),
+            conn: Arc::new(Mutex::new(conn)),
+            not_found: Arc::new(RwLock::new(HashSet::new())),
+            success: Arc::new(RwLock::new(HashSet::new())),
+            retry_not_found_days,
+        })
     }
 
     pub fn migrate_legacy_json(&self) -> Result<()> {
-        let Some(config_dir) = self.path.parent() else {
+        let Some(config_dir) = self.db_path.parent() else {
             return Ok(());
         };
         let old_path = config_dir.join("cache.json");
@@ -87,8 +85,7 @@ impl CacheDb {
 
         let paths: Vec<String> = serde_json::from_slice(&fs::read(&old_path)?)?;
         let now = unix_now();
-        let _guard = self.lock.lock().expect("db lock poisoned");
-        let conn = self.open()?;
+        let conn = self.conn.lock().expect("db lock poisoned");
         for path in paths {
             conn.execute(
                 "INSERT OR IGNORE INTO track_cache (path, status, updated_at) VALUES (?1, 'not_found', ?2)",
@@ -102,8 +99,7 @@ impl CacheDb {
 
     pub fn load_memory_cache(&self) -> Result<()> {
         let retry_threshold = unix_now() - (self.retry_not_found_days as f64 * 86_400.0);
-        let _guard = self.lock.lock().expect("db lock poisoned");
-        let conn = self.open()?;
+        let conn = self.conn.lock().expect("db lock poisoned");
         let mut stmt = conn.prepare("SELECT path, status, updated_at FROM track_cache")?;
         let mut rows = stmt.query([])?;
 
@@ -149,10 +145,9 @@ impl CacheDb {
         tags: Option<&TrackTags>,
         lyrics: Option<&str>,
     ) -> Result<()> {
-        let empty = TrackTags::empty();
+        let empty = TrackTags::default();
         let tags = tags.unwrap_or(&empty);
-        let _guard = self.lock.lock().expect("db lock poisoned");
-        let conn = self.open()?;
+        let conn = self.conn.lock().expect("db lock poisoned");
         conn.execute(
             r#"
             INSERT OR REPLACE INTO track_cache
@@ -181,8 +176,7 @@ impl CacheDb {
     }
 
     pub fn mark_not_found(&self, rel_path: &str, tags: &TrackTags) -> Result<()> {
-        let _guard = self.lock.lock().expect("db lock poisoned");
-        let conn = self.open()?;
+        let conn = self.conn.lock().expect("db lock poisoned");
         conn.execute(
             r#"
             INSERT OR REPLACE INTO track_cache
@@ -210,8 +204,7 @@ impl CacheDb {
     }
 
     pub fn find_cached_lyrics(&self, tags: &TrackTags) -> Result<Option<String>> {
-        let _guard = self.lock.lock().expect("db lock poisoned");
-        let conn = self.open()?;
+        let conn = self.conn.lock().expect("db lock poisoned");
         let mut stmt = conn.prepare(
             r#"
             SELECT lyrics FROM track_cache
@@ -224,11 +217,6 @@ impl CacheDb {
         )?;
         let mut rows = stmt.query(params![tags.artist, tags.title, tags.duration_secs])?;
         Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
-    }
-
-    fn open(&self) -> Result<Connection> {
-        Connection::open(self.path.as_ref())
-            .with_context(|| format!("opening {}", self.path.display()))
     }
 }
 
@@ -245,11 +233,4 @@ fn unix_now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_secs_f64()
-}
-
-pub fn rel_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }

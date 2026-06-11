@@ -30,6 +30,8 @@ docker compose up -d --build
 | `LRCGET_RETRY_NOT_FOUND_DAYS` | `7` | Days to wait before retrying tracks previously not found. |
 | `LRCGET_REQUEST_INTERVAL_MS` | `750` | Shared minimum delay between LRCLib requests across all workers. |
 | `LRCGET_ORPHAN_ACTION` | `keep` | What to do with unmatched `.lrc` files during scans: `keep`, `reconcile`, `quarantine`, or `delete`. |
+| `LRCGET_FALLBACK_SCAN_SECONDS` | `43200` | Seconds between periodic full rescans (minimum `60`, maximum `604800`). Default is 12 hours. |
+| `LRCGET_FOLLOW_SYMLINKS` | `false` | Follow symbolic links when scanning the music directory. |
 | `LRCGET_CONFIG_DIR` | `./config` | Host path mounted as `/config`. |
 | `LRCGET_MUSIC_DIR` | `./music` | Host path mounted as `/music`. |
 

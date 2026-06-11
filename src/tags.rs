@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
 use lofty::{
@@ -8,7 +9,14 @@ use lofty::{
 };
 use regex::Regex;
 
-#[derive(Debug, Clone)]
+static RE_CLEAN_METADATA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\s*[\(\[\{](?:[^\)\]\}]*?\b)?(?:remaster|remastered|mix|remix|live|edit|version|session|deluxe|anniversary|edition|mono|stereo|re-recorded|digitally|reissue|restored)\b[^\)\]\}]*?[\)\]\}]\s*$",
+    )
+    .expect("valid clean metadata regex")
+});
+
+#[derive(Debug, Clone, Default)]
 pub struct TrackTags {
     pub title: String,
     pub artist: String,
@@ -17,14 +25,6 @@ pub struct TrackTags {
 }
 
 impl TrackTags {
-    pub fn empty() -> Self {
-        Self {
-            title: String::new(),
-            artist: String::new(),
-            album: String::new(),
-            duration_secs: 0,
-        }
-    }
 
     pub fn cleaned(&self) -> Self {
         Self {
@@ -76,9 +76,55 @@ fn clean_metadata_value(value: &str) -> String {
     if value.trim().is_empty() {
         return value.to_string();
     }
-    let pattern = Regex::new(
-        r"(?i)\s*[\(\[\{](?:[^\)\]\}]*?\b)?(?:remaster|remastered|mix|remix|live|edit|version|session|deluxe|anniversary|edition|mono|stereo|re-recorded|digitally|reissue|restored)\b[^\)\]\}]*?[\)\]\}]\s*$",
-    )
-    .expect("valid clean metadata regex");
-    pattern.replace(value, "").trim().to_string()
+    RE_CLEAN_METADATA.replace(value, "").trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_metadata_strips_remaster() {
+        assert_eq!(
+            clean_metadata_value("Song Title (Remastered 2023)"),
+            "Song Title"
+        );
+    }
+
+    #[test]
+    fn test_clean_metadata_strips_deluxe_edition() {
+        assert_eq!(
+            clean_metadata_value("Album Name [Deluxe Edition]"),
+            "Album Name"
+        );
+    }
+
+    #[test]
+    fn test_clean_metadata_preserves_normal() {
+        assert_eq!(
+            clean_metadata_value("Normal Song Title"),
+            "Normal Song Title"
+        );
+    }
+
+    #[test]
+    fn test_clean_metadata_empty() {
+        assert_eq!(clean_metadata_value(""), "");
+        assert_eq!(clean_metadata_value("  "), "  ");
+    }
+
+    #[test]
+    fn test_cleaned_tags() {
+        let tags = TrackTags {
+            title: "Song (Remastered 2020)".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album [Deluxe Edition]".to_string(),
+            duration_secs: 200,
+        };
+        let cleaned = tags.cleaned();
+        assert_eq!(cleaned.title, "Song");
+        assert_eq!(cleaned.album, "Album");
+        assert_eq!(cleaned.artist, "Artist");
+        assert_eq!(cleaned.duration_secs, 200);
+    }
 }

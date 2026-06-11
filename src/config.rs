@@ -31,6 +31,7 @@ pub struct Config {
     pub retry_not_found_days: u64,
     pub request_interval: Duration,
     pub orphan_action: OrphanAction,
+    pub follow_symlinks: bool,
     pub fallback_interval: Duration,
 }
 
@@ -55,6 +56,7 @@ impl Config {
             orphan_action: OrphanAction::parse(
                 &env::var("LRCGET_ORPHAN_ACTION").unwrap_or_else(|_| "keep".to_string()),
             )?,
+            follow_symlinks: parse_bool("LRCGET_FOLLOW_SYMLINKS", false)?,
             fallback_interval: Duration::from_secs(parse_u64(
                 "LRCGET_FALLBACK_SCAN_SECONDS",
                 43_200,

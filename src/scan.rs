@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::Duration,
 };
@@ -15,10 +15,15 @@ use walkdir::WalkDir;
 
 use crate::{
     config::{Config, OrphanAction},
-    db::{rel_path, CacheDb},
+    db::CacheDb,
     lrclib::{LrclibClient, LyricsResult},
     tags::read_tags,
 };
+
+static RE_LEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+\s*[-._]?\s*").unwrap());
+static RE_BRACKETED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\(\[\{].*?[\)\]\}]").unwrap());
+static RE_FEATURED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(feat|ft)\b.*").unwrap());
+static RE_NON_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\W_]+").unwrap());
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "ogg", "opus"];
 
@@ -60,6 +65,9 @@ impl Processor {
         }
     }
 
+    /// Process a file detected by the filesystem watcher.
+    /// Unlike scan, this intentionally does NOT skip `success` entries — if a user
+    /// deletes an `.lrc` file, the watch event should re-fetch lyrics.
     pub fn process_watch_path(&self, path: PathBuf) {
         if !is_audio_file(&path) {
             return;
@@ -179,7 +187,7 @@ pub fn sync_library(pool: &ThreadPool, processor: Processor) -> Result<()> {
 
     let mut by_dir: HashMap<PathBuf, DirectoryFiles> = HashMap::new();
     for entry in WalkDir::new(&processor.inner.config.music_dir)
-        .follow_links(false)
+        .follow_links(processor.inner.config.follow_symlinks)
         .into_iter()
         .filter_map(|entry| match entry {
             Ok(entry) => Some(entry),
@@ -356,8 +364,10 @@ fn write_lyrics(path: &Path, lyrics: &str) -> Result<()> {
     }
     let tmp = path.with_extension("lrc.tmp");
     fs::write(&tmp, lyrics).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()));
+    }
     Ok(())
 }
 
@@ -417,18 +427,97 @@ fn clean_name(name: &str) -> String {
         .file_stem()
         .map(|stem| stem.to_string_lossy())
         .unwrap_or_default();
-    let leading = Regex::new(r"^\d+\s*[-._]?\s*").expect("valid regex");
-    let bracketed = Regex::new(r"[\(\[\{].*?[\)\]\}]").expect("valid regex");
-    let featured = Regex::new(r"(?i)\b(feat|ft)\b.*").expect("valid regex");
-    let non_word = Regex::new(r"[\W_]+").expect("valid regex");
-    let value = leading.replace(&stem, "");
-    let value = bracketed.replace_all(&value, "");
-    let value = featured.replace_all(&value, "");
-    non_word.replace_all(&value, "").to_ascii_lowercase()
+    let value = RE_LEADING.replace(&stem, "");
+    let value = RE_BRACKETED.replace_all(&value, "");
+    let value = RE_FEATURED.replace_all(&value, "");
+    RE_NON_WORD.replace_all(&value, "").to_ascii_lowercase()
 }
 
 #[derive(Default)]
 struct DirectoryFiles {
     audio: Vec<PathBuf>,
     lrc: HashMap<String, PathBuf>,
+}
+
+fn rel_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_audio_file() {
+        assert!(is_audio_file(Path::new("song.mp3")));
+        assert!(is_audio_file(Path::new("song.FLAC")));
+        assert!(is_audio_file(Path::new("song.m4a")));
+        assert!(is_audio_file(Path::new("song.ogg")));
+        assert!(is_audio_file(Path::new("song.opus")));
+        assert!(!is_audio_file(Path::new("song.lrc")));
+        assert!(!is_audio_file(Path::new("song.txt")));
+        assert!(!is_audio_file(Path::new("song")));
+    }
+
+    #[test]
+    fn test_track_number() {
+        assert_eq!(track_number("01 Song.mp3"), Some(1));
+        assert_eq!(track_number("12-Track.flac"), Some(12));
+        assert_eq!(track_number("Song.mp3"), None);
+        assert_eq!(track_number(""), None);
+    }
+
+    #[test]
+    fn test_clean_name() {
+        assert_eq!(clean_name("01 - Song Title.mp3"), "songtitle");
+        assert_eq!(clean_name("03. Hello World (feat. Artist).flac"), "helloworld");
+        assert_eq!(clean_name("Track [Remastered].mp3"), "track");
+    }
+
+    #[test]
+    fn test_find_orphan_match_by_track_number() {
+        let lrc_names = vec!["01 - Different Name.lrc".to_string()];
+        let result = find_orphan_match(
+            Path::new("01 - Song.mp3"),
+            lrc_names.iter(),
+        );
+        assert_eq!(result, Some("01 - Different Name.lrc".to_string()));
+    }
+
+    #[test]
+    fn test_find_orphan_match_by_clean_name() {
+        let lrc_names = vec!["Song Title.lrc".to_string()];
+        let result = find_orphan_match(
+            Path::new("Song Title.mp3"),
+            lrc_names.iter(),
+        );
+        assert_eq!(result, Some("Song Title.lrc".to_string()));
+    }
+
+    #[test]
+    fn test_find_orphan_no_match() {
+        let lrc_names = vec!["Completely Different.lrc".to_string()];
+        let result = find_orphan_match(
+            Path::new("My Song.mp3"),
+            lrc_names.iter(),
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_rel_path_strips_prefix() {
+        let path = Path::new("/music/Artist/Album/song.mp3");
+        let root = Path::new("/music");
+        assert_eq!(rel_path(path, root), "Artist/Album/song.mp3");
+    }
+
+    #[test]
+    fn test_rel_path_no_prefix() {
+        let path = Path::new("/other/song.mp3");
+        let root = Path::new("/music");
+        assert_eq!(rel_path(path, root), "/other/song.mp3");
+    }
 }
