@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     db.migrate_legacy_json()?;
     db.load_memory_cache()?;
 
-    let lrclib = LrclibClient::new(config.request_interval)?;
+    let lrclib = LrclibClient::new(config.request_interval, config.request_timeout)?;
     let processor = Processor::new(config.clone(), db, lrclib);
     let pool = Arc::new(
         ThreadPoolBuilder::new()

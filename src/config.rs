@@ -30,6 +30,7 @@ pub struct Config {
     pub clean_fallback: bool,
     pub retry_not_found_days: u64,
     pub request_interval: Duration,
+    pub request_timeout: Duration,
     pub orphan_action: OrphanAction,
     pub follow_symlinks: bool,
     pub fallback_interval: Duration,
@@ -52,6 +53,12 @@ impl Config {
                 750,
                 0,
                 60_000,
+            )?),
+            request_timeout: Duration::from_secs(parse_u64(
+                "LRCGET_REQUEST_TIMEOUT_SECONDS",
+                30,
+                1,
+                300,
             )?),
             orphan_action: OrphanAction::parse(
                 &env::var("LRCGET_ORPHAN_ACTION").unwrap_or_else(|_| "keep".to_string()),

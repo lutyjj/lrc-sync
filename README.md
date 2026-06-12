@@ -29,6 +29,7 @@ docker compose up -d --build
 | `LRCGET_CLEAN_FALLBACK` | `true` | Retry lookups with cleaned title/album metadata. |
 | `LRCGET_RETRY_NOT_FOUND_DAYS` | `7` | Days to wait before retrying tracks previously not found. |
 | `LRCGET_REQUEST_INTERVAL_MS` | `750` | Shared minimum delay between LRCLib requests across all workers. |
+| `LRCGET_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout for LRCLib HTTP calls. |
 | `LRCGET_ORPHAN_ACTION` | `keep` | What to do with unmatched `.lrc` files during scans: `keep`, `reconcile`, `quarantine`, or `delete`. |
 | `LRCGET_FALLBACK_SCAN_SECONDS` | `43200` | Seconds between periodic full rescans (minimum `60`, maximum `604800`). Default is 12 hours. |
 | `LRCGET_FOLLOW_SYMLINKS` | `false` | Follow symbolic links when scanning the music directory. |
@@ -44,4 +45,3 @@ cargo fmt --check
 cargo clippy -- -D warnings
 cargo test
 ```
-
