@@ -11,6 +11,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/lrcget-cli /usr/local/bin/lrcget-cli
+COPY --from=builder /app/target/release/lrc-sync /usr/local/bin/lrc-sync
 
-CMD ["lrcget-cli"]
+CMD ["lrc-sync"]

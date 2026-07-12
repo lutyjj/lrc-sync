@@ -1,4 +1,4 @@
-IMAGE ?= lrcget-cli
+IMAGE ?= lrc-sync
 
 .PHONY: build check fmt clippy test
 

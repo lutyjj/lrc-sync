@@ -17,7 +17,7 @@ impl OrphanAction {
             "reconcile" => Ok(Self::Reconcile),
             "quarantine" => Ok(Self::Quarantine),
             "delete" => Ok(Self::Delete),
-            other => bail!("invalid LRCGET_ORPHAN_ACTION={other:?}; expected keep, reconcile, quarantine, or delete"),
+            other => bail!("invalid LRCSYNC_ORPHAN_ACTION={other:?}; expected keep, reconcile, quarantine, or delete"),
         }
     }
 }
@@ -40,32 +40,32 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             music_dir: PathBuf::from(
-                env::var("LRCGET_MUSIC_PATH").unwrap_or_else(|_| "/music".to_string()),
+                env::var("LRCSYNC_MUSIC_DIR").unwrap_or_else(|_| "/music".to_string()),
             ),
             db_file: PathBuf::from(
-                env::var("LRCGET_DB_PATH").unwrap_or_else(|_| "/config/lyrics.db".to_string()),
+                env::var("LRCSYNC_DB_PATH").unwrap_or_else(|_| "/config/lyrics.db".to_string()),
             ),
-            concurrency: parse_usize("LRCGET_CONCURRENCY", 8, 1, 128)?,
-            clean_fallback: parse_bool("LRCGET_CLEAN_FALLBACK", true)?,
-            retry_not_found_days: parse_u64("LRCGET_RETRY_NOT_FOUND_DAYS", 7, 1, 3650)?,
+            concurrency: parse_usize("LRCSYNC_CONCURRENCY", 8, 1, 128)?,
+            clean_fallback: parse_bool("LRCSYNC_CLEAN_FALLBACK", true)?,
+            retry_not_found_days: parse_u64("LRCSYNC_RETRY_NOT_FOUND_DAYS", 7, 1, 3650)?,
             request_interval: Duration::from_millis(parse_u64(
-                "LRCGET_REQUEST_INTERVAL_MS",
+                "LRCSYNC_REQUEST_INTERVAL_MS",
                 750,
                 0,
                 60_000,
             )?),
             request_timeout: Duration::from_secs(parse_u64(
-                "LRCGET_REQUEST_TIMEOUT_SECONDS",
+                "LRCSYNC_REQUEST_TIMEOUT_SECONDS",
                 30,
                 1,
                 300,
             )?),
             orphan_action: OrphanAction::parse(
-                &env::var("LRCGET_ORPHAN_ACTION").unwrap_or_else(|_| "keep".to_string()),
+                &env::var("LRCSYNC_ORPHAN_ACTION").unwrap_or_else(|_| "keep".to_string()),
             )?,
-            follow_symlinks: parse_bool("LRCGET_FOLLOW_SYMLINKS", false)?,
+            follow_symlinks: parse_bool("LRCSYNC_FOLLOW_SYMLINKS", false)?,
             fallback_interval: Duration::from_secs(parse_u64(
-                "LRCGET_FALLBACK_SCAN_SECONDS",
+                "LRCSYNC_FALLBACK_SCAN_SECONDS",
                 43_200,
                 60,
                 604_800,

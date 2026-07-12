@@ -333,7 +333,7 @@ fn handle_remaining_orphans(
             }
         }
         OrphanAction::Quarantine => {
-            let quarantine_dir = dir.join(".lrcget-orphans");
+            let quarantine_dir = dir.join(".lrcsync-orphans");
             fs::create_dir_all(&quarantine_dir)?;
             for (name, path) in lrc_files {
                 let dest = quarantine_dir.join(name);

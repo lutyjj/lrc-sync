@@ -24,7 +24,7 @@ fn main() -> Result<()> {
     init_logging();
 
     let config = Config::from_env()?;
-    info!(?config, "starting lrcget-cli");
+    info!(?config, "starting lrc-sync");
 
     let db = CacheDb::open(config.db_file.clone(), config.retry_not_found_days)?;
     db.migrate_legacy_json()?;
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let pool = Arc::new(
         ThreadPoolBuilder::new()
             .num_threads(config.concurrency)
-            .thread_name(|idx| format!("lrcget-worker-{idx}"))
+            .thread_name(|idx| format!("lrc-sync-worker-{idx}"))
             .build()
             .context("building worker pool")?,
     );

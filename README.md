@@ -1,4 +1,4 @@
-# lrcget-cli
+# lrc-sync
 
 Containerized lyrics sync worker for a music library.
 
@@ -13,8 +13,8 @@ docker compose up -d --build
 By default the compose file uses local `./config` and `./music` folders. Override paths with environment variables:
 
 ```sh
-LRCGET_CONFIG_DIR=/path/to/config \
-LRCGET_MUSIC_DIR=/path/to/music \
+LRCSYNC_CONFIG_DIR=/path/to/config \
+LRCSYNC_MUSIC_DIR=/path/to/music \
 docker compose up -d --build
 ```
 

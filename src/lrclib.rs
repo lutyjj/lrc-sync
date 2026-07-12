@@ -28,7 +28,7 @@ impl LrclibClient {
     pub fn new(request_interval: Duration, request_timeout: Duration) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .user_agent("lrcget-cli/0.1 (contact: codeberg.org/lutyjj/lrcget-cli)")
+                .user_agent("lrc-sync/0.1")
                 .timeout(request_timeout)
                 .build()?,
             limiter: Arc::new(RateLimiter::new(request_interval)),
