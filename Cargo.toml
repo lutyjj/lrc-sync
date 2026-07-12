@@ -1,8 +1,9 @@
 [package]
 name = "lrcget-cli"
 version = "0.1.0"
-edition = "2021"
-license = "MIT"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["lutyjj"]
 
 [dependencies]
 anyhow = "1"
