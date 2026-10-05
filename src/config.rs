@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, time::Duration};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanAction {
@@ -10,6 +10,12 @@ pub enum OrphanAction {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchMode {
+    Poll,
+    Native,
+}
+
 impl OrphanAction {
     fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -17,7 +23,9 @@ impl OrphanAction {
             "reconcile" => Ok(Self::Reconcile),
             "quarantine" => Ok(Self::Quarantine),
             "delete" => Ok(Self::Delete),
-            other => bail!("invalid LRCSYNC_ORPHAN_ACTION={other:?}; expected keep, reconcile, quarantine, or delete"),
+            other => bail!(
+                "invalid LRCSYNC_ORPHAN_ACTION={other:?}; expected keep, reconcile, quarantine, or delete"
+            ),
         }
     }
 }
@@ -34,6 +42,9 @@ pub struct Config {
     pub orphan_action: OrphanAction,
     pub follow_symlinks: bool,
     pub fallback_interval: Duration,
+    pub watch_mode: WatchMode,
+    pub poll_interval: Duration,
+    pub max_pending_dirs: usize,
 }
 
 impl Config {
@@ -43,7 +54,7 @@ impl Config {
                 env::var("LRCSYNC_MUSIC_DIR").unwrap_or_else(|_| "/music".to_string()),
             ),
             db_file: PathBuf::from(
-                env::var("LRCSYNC_DB_PATH").unwrap_or_else(|_| "/config/lyrics.db".to_string()),
+                env::var("LRCSYNC_DB_PATH").unwrap_or_else(|_| "/config/cache.sqlite3".to_string()),
             ),
             concurrency: parse_usize("LRCSYNC_CONCURRENCY", 8, 1, 128)?,
             clean_fallback: parse_bool("LRCSYNC_CLEAN_FALLBACK", true)?,
@@ -66,10 +77,27 @@ impl Config {
             follow_symlinks: parse_bool("LRCSYNC_FOLLOW_SYMLINKS", false)?,
             fallback_interval: Duration::from_secs(parse_u64(
                 "LRCSYNC_FALLBACK_SCAN_SECONDS",
-                43_200,
+                300,
                 60,
                 604_800,
             )?),
+            watch_mode: match env::var("LRCSYNC_WATCH_MODE")
+                .unwrap_or_else(|_| "poll".into())
+                .trim()
+                .to_lowercase()
+                .as_str()
+            {
+                "poll" => WatchMode::Poll,
+                "native" => WatchMode::Native,
+                other => bail!("invalid LRCSYNC_WATCH_MODE={other:?}; expected poll or native"),
+            },
+            poll_interval: Duration::from_secs(parse_u64(
+                "LRCSYNC_POLL_INTERVAL_SECONDS",
+                30,
+                1,
+                300,
+            )?),
+            max_pending_dirs: parse_usize("LRCSYNC_MAX_PENDING_DIRS", 128, 1, 4096)?,
         })
     }
 }
