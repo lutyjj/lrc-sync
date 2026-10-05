@@ -1,16 +1,26 @@
-FROM rust:1.91-bookworm AS builder
+FROM rust:1.99-trixie@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked || cargo build --release
+COPY tests ./tests
 
-FROM debian:bookworm-slim
+FROM builder AS test
+RUN cargo test --locked
+
+FROM test AS release
+RUN cargo build --release --locked
+
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/lrc-sync /usr/local/bin/lrc-sync
+COPY --from=release /app/target/release/lrc-sync /usr/local/bin/lrc-sync
 
 CMD ["lrc-sync"]

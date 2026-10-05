@@ -1,523 +1,871 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
-    thread,
-    time::Duration,
+    sync::{Arc, LazyLock},
 };
 
 use anyhow::{Context, Result};
-use rayon::ThreadPool;
 use regex::Regex;
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
     config::{Config, OrphanAction},
-    db::CacheDb,
+    db::{CacheDb, CachedResult, Origin},
+    files::{self, FileStamp},
     lrclib::{LrclibClient, LyricsResult},
-    tags::read_tags,
+    queue::{Admission, WorkItem, WorkQueue},
+    shutdown::Shutdown,
+    tags::{TrackTags, read_tags},
 };
 
-static RE_LEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+\s*[-._]?\s*").unwrap());
-static RE_BRACKETED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\(\[\{].*?[\)\]\}]").unwrap());
-static RE_FEATURED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(feat|ft)\b.*").unwrap());
-static RE_NON_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\W_]+").unwrap());
-
-const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "ogg", "opus"];
+static TRACK_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{1,3}[-._\s]+\s*").expect("valid track prefix regex"));
 
 #[derive(Clone)]
 pub struct Processor {
     inner: Arc<ProcessorInner>,
 }
 
+pub enum ProcessingOutcome {
+    Complete,
+    Retry,
+    StaleRoute,
+}
+
 struct ProcessorInner {
     config: Config,
     db: CacheDb,
     lrclib: LrclibClient,
-    active: Mutex<HashSet<PathBuf>>,
+    shutdown: Shutdown,
 }
 
-#[derive(Debug, Clone)]
-struct TrackJob {
-    audio_path: PathBuf,
-    rel_path: String,
-    lrc_path: PathBuf,
-    source: JobSource,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum JobSource {
-    Scan,
-    Watch,
+struct Audio {
+    path: PathBuf,
+    cache_path: PathBuf,
+    tags: TrackTags,
+    stamp: FileStamp,
 }
 
 impl Processor {
-    pub fn new(config: Config, db: CacheDb, lrclib: LrclibClient) -> Self {
+    pub fn new(config: Config, db: CacheDb, lrclib: LrclibClient, shutdown: Shutdown) -> Self {
         Self {
             inner: Arc::new(ProcessorInner {
                 config,
                 db,
                 lrclib,
-                active: Mutex::new(HashSet::new()),
+                shutdown,
             }),
         }
     }
 
-    /// Process a file detected by the filesystem watcher.
-    /// Unlike scan, this intentionally does NOT skip `success` entries — if a user
-    /// deletes an `.lrc` file, the watch event should re-fetch lyrics.
-    pub fn process_watch_path(&self, path: PathBuf) {
-        if !is_audio_file(&path) {
-            return;
-        }
-        let rel_path = rel_path(&path, &self.inner.config.music_dir);
-        if self.inner.db.is_not_found(&rel_path) {
-            debug!(path = %path.display(), "skipping cached not_found watch event");
-            return;
-        }
-        let lrc_path = path.with_extension("lrc");
-        if lrc_path.exists() {
-            return;
-        }
-        self.process_track(TrackJob {
-            audio_path: path,
-            rel_path,
-            lrc_path,
-            source: JobSource::Watch,
-        });
-    }
-
-    fn process_track(&self, job: TrackJob) {
+    /// Access policy uses the submitted path; filesystem work uses its pinned owner.
+    pub fn process_work(&self, work: &WorkItem) -> Result<ProcessingOutcome> {
+        let eligible = files::eligible(&self.inner.config, &work.directory);
+        if !work
+            .directory
+            .canonicalize()
+            .is_ok_and(|current| current == work.physical_directory())
         {
-            let mut active = self.inner.active.lock().expect("active set poisoned");
-            if !active.insert(job.audio_path.clone()) {
-                return;
-            }
+            return Ok(ProcessingOutcome::StaleRoute);
         }
-
-        let result = self.process_track_inner(&job);
-        self.inner
-            .active
-            .lock()
-            .expect("active set poisoned")
-            .remove(&job.audio_path);
-
-        if let Err(err) = result {
-            error!(path = %job.audio_path.display(), error = %err, "track processing failed");
+        if !eligible {
+            return Ok(ProcessingOutcome::Complete);
         }
+        let mut config = self.inner.config.clone();
+        config.music_dir = work.physical_directory().to_owned();
+        let changed = Self::new(
+            config,
+            self.inner.db.clone(),
+            self.inner.lrclib.clone(),
+            self.inner.shutdown.clone(),
+        )
+        .process_directory(work.physical_directory())?;
+        Ok(if changed {
+            ProcessingOutcome::Retry
+        } else {
+            ProcessingOutcome::Complete
+        })
     }
 
-    fn process_track_inner(&self, job: &TrackJob) -> Result<()> {
-        let tags = match read_tags(&job.audio_path) {
-            Ok(tags) => Some(tags),
-            Err(err) if matches!(job.source, JobSource::Watch) => {
-                debug!(path = %job.audio_path.display(), error = %err, "tag read failed for watch event; retrying once");
-                thread::sleep(Duration::from_secs(3));
-                Some(read_tags(&job.audio_path)?)
-            }
+    /// Called by the directory's sole queue owner; true requests a fresh pass.
+    pub fn process_directory(&self, directory: &Path) -> Result<bool> {
+        if self.inner.shutdown.is_cancelled() || !files::eligible(&self.inner.config, directory) {
+            return Ok(false);
+        }
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => {
-                warn!(path = %job.audio_path.display(), error = %err, "skipping file with unreadable tags");
-                None
+                return Err(err).with_context(|| format!("reading {}", directory.display()));
             }
         };
-        let Some(tags) = tags else {
-            return Ok(());
-        };
+        let mut audio = BTreeMap::<OsString, Vec<PathBuf>>::new();
+        let mut lrc = BTreeMap::<OsString, Vec<PathBuf>>::new();
+        let mut reserved = BTreeSet::new();
+        for entry in entries {
+            let path = entry.path();
+            let Some(stem) = path.file_stem() else {
+                continue;
+            };
+            // Even an excluded audio symlink reserves its paired sidecar from deletion.
+            if files::is_audio(&path) {
+                reserved.insert(stem.to_owned());
+            }
+            if !files::eligible(&self.inner.config, &path) || !path.is_file() {
+                continue;
+            }
+            if files::is_audio(&path) {
+                audio.entry(stem.to_owned()).or_default().push(path);
+            } else if files::is_lrc(&path) {
+                lrc.entry(stem.to_owned()).or_default().push(path);
+            }
+        }
+        if self.inner.config.orphan_action == OrphanAction::Reconcile {
+            self.reconcile(&audio, &mut lrc)?;
+        }
+        let mut changed = false;
+        for (stem, mut paths) in audio {
+            if self.inner.shutdown.is_cancelled() {
+                break;
+            }
+            paths.sort();
+            let sidecars = lrc.remove(&stem).unwrap_or_default();
+            if sidecars.len() > 1 {
+                warn!(directory = %directory.display(), stem = ?stem, "multiple sidecars share a stem; preserving all candidates");
+                continue;
+            }
+            match self.process_group(&paths, sidecars.first().map(PathBuf::as_path)) {
+                Ok(retry) => changed |= retry,
+                Err(err) => {
+                    error!(path = %paths[0].display(), error = %format!("{err:#}"), "track processing failed; will retry on a later scan")
+                }
+            }
+        }
+        for (stem, paths) in lrc {
+            if reserved.contains(&stem) {
+                continue;
+            }
+            for path in paths {
+                if self.inner.shutdown.is_cancelled() {
+                    return Ok(changed);
+                }
+                // Imports may have added audio after the snapshot; classify again before mutation.
+                if has_audio(&path)? || fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                    continue;
+                }
+                match self.inner.config.orphan_action {
+                    OrphanAction::Keep | OrphanAction::Reconcile => {
+                        debug!(path = %path.display(), "preserving unmatched lyric file")
+                    }
+                    OrphanAction::Quarantine => {
+                        let target = files::quarantine(&path)?;
+                        info!(from = %path.display(), to = %target.display(), "archived unmatched lyric file");
+                    }
+                    OrphanAction::Delete => {
+                        fs::remove_file(&path)
+                            .with_context(|| format!("deleting {}", path.display()))?;
+                        info!(path = %path.display(), "deleted unmatched lyric file");
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
 
-        if job.lrc_path.exists() {
-            let lyrics = fs::read_to_string(&job.lrc_path).ok();
+    fn process_group(&self, paths: &[PathBuf], existing: Option<&Path>) -> Result<bool> {
+        let mut audio = Vec::new();
+        for path in paths {
+            let stamp = FileStamp::read(path)?;
+            let tags = read_tags(path)?;
+            if FileStamp::read(path)? != stamp {
+                return Ok(true);
+            }
+            audio.push(Audio {
+                path: path.clone(),
+                // Cache ownership follows the sidecar's physical directory. File symlink
+                // names retain distinct sidecars, while directory aliases share provenance.
+                cache_path: cache_path(path)?,
+                tags,
+                stamp,
+            });
+        }
+        let tags = &audio[0].tags;
+        if audio
+            .iter()
+            .any(|item| item.tags.normalized() != tags.normalized())
+        {
+            warn!(path = %audio[0].path.display(), "different recordings share one sidecar filename; refusing to choose a track");
+            return Ok(false);
+        }
+        let destination = audio[0].path.with_extension("lrc");
+        if !files::eligible(&self.inner.config, &destination) {
+            return Ok(false);
+        }
+        if let Some(path) = existing {
+            let lyrics = files::read_lyrics(path)?;
+            let stale_generated = self
+                .inner
+                .db
+                .sidecar_record(&audio[0].cache_path.with_extension("lrc"))?
+                .is_some_and(|record| {
+                    record.tags != tags.normalized()
+                        && record.origin == Origin::Generated
+                        && record.lyrics == lyrics
+                });
+            if !stale_generated {
+                for item in &audio {
+                    self.inner.db.ingest(&item.cache_path, tags, &lyrics)?;
+                }
+                return Ok(false);
+            }
+            if !self.still_current(&audio) {
+                return Ok(true);
+            }
+            let archive = files::quarantine(path)?;
+            info!(path = %path.display(), archive = %archive.display(), "archived generated lyrics for a replaced recording");
+            if path.exists() {
+                return Ok(true);
+            }
+        }
+        let cached = self.inner.db.cached(&audio[0].cache_path, tags)?;
+        let result = if matches!(cached, Some(CachedResult::Found { .. })) {
+            cached
+        } else {
             self.inner
                 .db
-                .mark_success(&job.rel_path, Some(&tags), lyrics.as_deref())?;
-            return Ok(());
-        }
-
-        if let Some(lyrics) = self.inner.db.find_cached_lyrics(&tags)? {
-            write_lyrics(&job.lrc_path, &lyrics)?;
-            info!(artist = %tags.artist, title = %tags.title, "restored lyrics from local cache");
-            self.inner
-                .db
-                .mark_success(&job.rel_path, Some(&tags), Some(&lyrics))?;
-            return Ok(());
-        }
-
-        let source = match job.source {
-            JobSource::Scan => "scan",
-            JobSource::Watch => "watch",
+                .find_cached_lyrics(tags)?
+                .map(|lyrics| CachedResult::Found {
+                    lyrics,
+                    origin: Origin::Generated,
+                })
+                .or(cached)
         };
-        info!(source, artist = %tags.artist, title = %tags.title, "fetching lyrics");
-
-        let mut lookup_tags = tags.clone();
-        let mut result = self.inner.lrclib.fetch(&lookup_tags);
-        if matches!(result, LyricsResult::NotFound) && self.inner.config.clean_fallback {
-            let cleaned = tags.cleaned();
-            if cleaned.title != tags.title || cleaned.album != tags.album {
-                info!(artist = %cleaned.artist, title = %cleaned.title, "retrying with cleaned metadata");
-                lookup_tags = cleaned;
-                result = self.inner.lrclib.fetch(&lookup_tags);
+        let (result, looked_up) = match result {
+            Some(result) => (result, false),
+            None => {
+                info!(artist = %tags.artist, title = %tags.title, "fetching lyrics");
+                (
+                    match self
+                        .inner
+                        .lrclib
+                        .fetch(tags, self.inner.config.clean_fallback)
+                    {
+                        LyricsResult::Found(lyrics) => CachedResult::Found {
+                            lyrics,
+                            origin: Origin::Generated,
+                        },
+                        LyricsResult::NotFound => CachedResult::NotFound,
+                        LyricsResult::Instrumental => CachedResult::Instrumental,
+                        LyricsResult::Ambiguous => {
+                            warn!(artist = %tags.artist, title = %tags.title, "ambiguous recording matches; leaving lyrics unchanged");
+                            return Ok(false);
+                        }
+                        LyricsResult::TemporaryFailure(reason) => {
+                            warn!(artist = %tags.artist, title = %tags.title, error = %reason, "lyrics lookup failed; will retry on a later scan");
+                            return Ok(false);
+                        }
+                        LyricsResult::Cancelled => return Ok(false),
+                    },
+                    true,
+                )
+            }
+        };
+        if self.inner.shutdown.is_cancelled() {
+            return Ok(false);
+        }
+        if !self.still_current(&audio) {
+            return Ok(true);
+        }
+        if let CachedResult::Found { lyrics, .. } = &result {
+            // The sidecar namespace includes uppercase extensions and nonregular collisions.
+            let candidates = sidecars_for(&audio[0].path)?;
+            if !candidates.is_empty() {
+                self.ingest_collision(&audio, tags, &candidates)?;
+                return Ok(false);
+            }
+            // Commit provenance first. A failed or interrupted publish can then be restored.
+            for item in &audio {
+                self.inner.db.store(&item.cache_path, tags, &result)?;
+            }
+            if !files::write_new(&destination, lyrics)? {
+                self.ingest_collision(&audio, tags, &sidecars_for(&audio[0].path)?)?;
+                return Ok(false);
+            }
+            let others: Vec<_> = sidecars_for(&audio[0].path)?
+                .into_iter()
+                .filter(|path| path != &destination)
+                .collect();
+            if !others.is_empty() {
+                files::quarantine(&destination)?;
+                self.ingest_collision(&audio, tags, &others)?;
+                return Ok(false);
+            }
+            info!(artist = %tags.artist, title = %tags.title, path = %destination.display(), "published lyrics");
+        } else if looked_up {
+            for item in &audio {
+                self.inner.db.store(&item.cache_path, tags, &result)?;
             }
         }
+        Ok(!self.still_current(&audio))
+    }
 
-        match result {
-            LyricsResult::Found(lyrics) => {
-                write_lyrics(&job.lrc_path, &lyrics)?;
-                info!(artist = %tags.artist, title = %tags.title, path = %job.lrc_path.display(), "saved lyrics");
-                self.inner
-                    .db
-                    .mark_success(&job.rel_path, Some(&tags), Some(&lyrics))?;
+    fn ingest_collision(&self, audio: &[Audio], tags: &TrackTags, paths: &[PathBuf]) -> Result<()> {
+        if paths.len() != 1 || !files::eligible(&self.inner.config, &paths[0]) {
+            warn!(path = %audio[0].path.display(), "preserving ambiguous or excluded sidecar collision");
+            return Ok(());
+        }
+        let lyrics = files::read_lyrics(&paths[0])?;
+        for item in audio {
+            self.inner.db.store(
+                &item.cache_path,
+                tags,
+                &CachedResult::Found {
+                    lyrics: lyrics.clone(),
+                    origin: Origin::Curated,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn still_current(&self, audio: &[Audio]) -> bool {
+        audio.iter().all(|item| {
+            files::eligible(&self.inner.config, &item.path)
+                && FileStamp::read(&item.path).is_ok_and(|stamp| stamp == item.stamp)
+                && read_tags(&item.path)
+                    .is_ok_and(|tags| tags.normalized() == item.tags.normalized())
+        })
+    }
+
+    fn reconcile(
+        &self,
+        audio: &BTreeMap<OsString, Vec<PathBuf>>,
+        lrc: &mut BTreeMap<OsString, Vec<PathBuf>>,
+    ) -> Result<()> {
+        let groups: Vec<_> = audio
+            .iter()
+            .filter_map(|(stem, paths)| {
+                let tags = paths
+                    .iter()
+                    .map(|path| read_tags(path).map(|tags| tags.normalized()))
+                    .collect::<Result<Vec<_>>>()
+                    .ok()?;
+                Some((stem, tags))
+            })
+            .collect();
+        for (stem, candidates) in &groups {
+            if lrc.contains_key(*stem)
+                || candidates
+                    .iter()
+                    .any(|candidate| candidate != &candidates[0])
+            {
+                continue;
             }
-            LyricsResult::NotFound => {
-                info!(artist = %tags.artist, title = %tags.title, "lyrics not found");
-                self.inner.db.mark_not_found(&job.rel_path, &tags)?;
+            let tags = &candidates[0];
+            let title = OsStr::new(&tags.title);
+            if groups
+                .iter()
+                .filter(|(_, others)| {
+                    others
+                        .iter()
+                        .any(|other| title_key(OsStr::new(&other.title)) == title_key(title))
+                })
+                .count()
+                != 1
+            {
+                continue;
             }
-            LyricsResult::TemporaryFailure => {
-                warn!(artist = %lookup_tags.artist, title = %lookup_tags.title, "lyrics lookup failed temporarily; will retry later");
+            let Some(name) =
+                unique_orphan_match(title, lrc.keys().filter(|name| !audio.contains_key(*name)))
+            else {
+                continue;
+            };
+            let sources = &lrc[&name];
+            if sources.len() != 1 {
+                continue;
+            }
+            let source = sources[0].clone();
+            let destination = audio[*stem][0].with_extension("lrc");
+            if has_audio(&source)? {
+                continue;
+            }
+            let Ok(lyrics) = files::read_lyrics(&source) else {
+                continue;
+            };
+            if let Some(record) = self
+                .inner
+                .db
+                .sidecar_record(&cache_path(&source)?.with_extension("lrc"))?
+                && (record.tags != *tags
+                    || (record.origin == Origin::Generated && record.lyrics == lyrics))
+            {
+                // Generated content uses exact cache reuse under its new owner.
+                continue;
+            }
+            if audio[*stem]
+                .iter()
+                .any(|path| !read_tags(path).is_ok_and(|current| current.normalized() == *tags))
+            {
+                continue;
+            }
+            if files::move_new(&source, &destination)? {
+                lrc.remove(&name);
+                lrc.insert((*stem).clone(), vec![destination.clone()]);
+                info!(from = %source.display(), to = %destination.display(), "reconciled uniquely tagged title");
             }
         }
-
         Ok(())
     }
 }
 
-pub fn sync_library(pool: &ThreadPool, processor: Processor) -> Result<()> {
-    info!("starting lyrics synchronization scan");
-    processor.inner.db.load_memory_cache()?;
-
-    let mut by_dir: HashMap<PathBuf, DirectoryFiles> = HashMap::new();
-    for entry in WalkDir::new(&processor.inner.config.music_dir)
-        .follow_links(processor.inner.config.follow_symlinks)
+pub fn queue_library(config: &Config, queue: &WorkQueue) -> Result<usize> {
+    let directories = WalkDir::new(&config.music_dir)
+        .follow_links(config.follow_symlinks)
         .into_iter()
+        .filter_entry(|entry| files::eligible(config, entry.path()))
         .filter_map(|entry| match entry {
-            Ok(entry) => Some(entry),
+            Ok(entry) if entry.file_type().is_dir() => Some(entry.into_path()),
+            Ok(_) => None,
             Err(err) => {
-                warn!(error = %err, "failed walking music directory entry");
+                warn!(error = %err, "music directory traversal failed");
                 None
             }
+        });
+    Ok(queue_directories(directories, queue))
+}
+
+fn queue_directories(directories: impl IntoIterator<Item = PathBuf>, queue: &WorkQueue) -> usize {
+    let mut count = 0;
+    for directory in directories {
+        match queue.submit(directory, true) {
+            Admission::Accepted => count += 1,
+            Admission::Unavailable => continue,
+            Admission::Stopped => break,
+            Admission::Full => unreachable!("blocking admission returned full"),
+        }
+    }
+    count
+}
+
+fn cache_path(path: &Path) -> Result<PathBuf> {
+    Ok(path
+        .parent()
+        .context("file has no parent")?
+        .canonicalize()?
+        .join(path.file_name().context("file has no filename")?))
+}
+
+fn has_audio(sidecar: &Path) -> Result<bool> {
+    let parent = sidecar.parent().context("sidecar has no parent")?;
+    for entry in fs::read_dir(parent)? {
+        let path = entry?.path();
+        if files::is_audio(&path) && path.file_stem() == sidecar.file_stem() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sidecars_for(audio: &Path) -> Result<Vec<PathBuf>> {
+    fs::read_dir(audio.parent().context("audio has no parent")?)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .filter(|entry| match entry {
+            Ok(path) => files::is_lrc(path) && path.file_stem() == audio.file_stem(),
+            Err(_) => true,
         })
-    {
-        if !entry.file_type().is_file() {
-            continue;
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn title_key(value: &OsStr) -> Option<String> {
+    let value: String = value
+        .to_str()?
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn unique_orphan_match<'a>(
+    title: &OsStr,
+    names: impl Iterator<Item = &'a OsString>,
+) -> Option<OsString> {
+    let wanted = title_key(title)?;
+    let mut matches = names.filter(|name| {
+        if title_key(name).is_some_and(|candidate| candidate == wanted) {
+            return true;
         }
-        let path = entry.path();
-        let Some(parent) = path.parent() else {
-            continue;
+        let Some(name) = name.to_str() else {
+            return false;
         };
-        let dir = by_dir.entry(parent.to_path_buf()).or_default();
-        if is_audio_file(path) {
-            dir.audio.push(path.to_path_buf());
-        } else if path
-            .extension()
-            .and_then(|v| v.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("lrc"))
-        {
-            dir.lrc.insert(file_name(path), path.to_path_buf());
-        }
-    }
-
-    let mut jobs = Vec::new();
-    let mut skipped_success = 0usize;
-    let mut skipped_not_found = 0usize;
-    let mut reconciled = 0usize;
-    let mut orphaned = 0usize;
-
-    for (dir, mut files) in by_dir {
-        let mut missing = Vec::new();
-
-        for audio_path in files.audio.drain(..) {
-            let lrc_name = audio_path
-                .file_stem()
-                .map(|stem| format!("{}.lrc", stem.to_string_lossy()))
-                .unwrap_or_else(|| "unknown.lrc".to_string());
-            let rel = rel_path(&audio_path, &processor.inner.config.music_dir);
-
-            if let Some(lrc_path) = files.lrc.remove(&lrc_name) {
-                if !processor.inner.db.is_success(&rel) {
-                    let tags = read_tags(&audio_path).ok();
-                    let lyrics = fs::read_to_string(&lrc_path).ok();
-                    processor
-                        .inner
-                        .db
-                        .mark_success(&rel, tags.as_ref(), lyrics.as_deref())?;
-                }
-                skipped_success += 1;
-            } else {
-                missing.push(audio_path);
-            }
-        }
-
-        if processor.inner.config.orphan_action == OrphanAction::Reconcile {
-            reconcile_orphans(&processor, &mut files.lrc, &mut missing, &mut reconciled)?;
-        }
-
-        orphaned += handle_remaining_orphans(&processor.inner.config, &dir, files.lrc)?;
-
-        for audio_path in missing {
-            let rel = rel_path(&audio_path, &processor.inner.config.music_dir);
-            if processor.inner.db.is_not_found(&rel) {
-                skipped_not_found += 1;
-                continue;
-            }
-            jobs.push(TrackJob {
-                lrc_path: audio_path.with_extension("lrc"),
-                audio_path,
-                rel_path: rel,
-                source: JobSource::Scan,
-            });
-        }
-    }
-
-    let total = jobs.len();
-    info!(
-        total,
-        skipped_not_found, skipped_success, reconciled, orphaned, "scan planning complete"
-    );
-
-    pool.scope(|scope| {
-        for job in jobs {
-            let processor = processor.clone();
-            scope.spawn(move |_| processor.process_track(job));
-        }
+        let numbered = TRACK_PREFIX.replace(name, "");
+        title_key(OsStr::new(numbered.as_ref())).is_some_and(|candidate| candidate == wanted)
     });
-
-    info!("scan complete");
-    Ok(())
-}
-
-fn reconcile_orphans(
-    processor: &Processor,
-    lrc_files: &mut HashMap<String, PathBuf>,
-    missing: &mut Vec<PathBuf>,
-    reconciled: &mut usize,
-) -> Result<()> {
-    let mut still_missing = Vec::new();
-
-    for audio_path in missing.drain(..) {
-        let Some(match_name) = find_orphan_match(&audio_path, lrc_files.keys()) else {
-            still_missing.push(audio_path);
-            continue;
-        };
-        let Some(src) = lrc_files.remove(&match_name) else {
-            still_missing.push(audio_path);
-            continue;
-        };
-        let dest = audio_path.with_extension("lrc");
-        fs::rename(&src, &dest)
-            .with_context(|| format!("renaming {} to {}", src.display(), dest.display()))?;
-        let rel = rel_path(&audio_path, &processor.inner.config.music_dir);
-        let tags = read_tags(&audio_path).ok();
-        let lyrics = fs::read_to_string(&dest).ok();
-        processor
-            .inner
-            .db
-            .mark_success(&rel, tags.as_ref(), lyrics.as_deref())?;
-        *reconciled += 1;
-        info!(from = %src.display(), to = %dest.display(), "reconciled orphaned lyric file");
-    }
-
-    *missing = still_missing;
-    Ok(())
-}
-
-fn handle_remaining_orphans(
-    config: &Config,
-    dir: &Path,
-    lrc_files: HashMap<String, PathBuf>,
-) -> Result<usize> {
-    let count = lrc_files.len();
-    match config.orphan_action {
-        OrphanAction::Keep | OrphanAction::Reconcile => {
-            for path in lrc_files.values() {
-                debug!(path = %path.display(), "leaving unmatched lyric file in place");
-            }
-        }
-        OrphanAction::Quarantine => {
-            let quarantine_dir = dir.join(".lrcsync-orphans");
-            fs::create_dir_all(&quarantine_dir)?;
-            for (name, path) in lrc_files {
-                let dest = quarantine_dir.join(name);
-                fs::rename(&path, &dest).with_context(|| {
-                    format!(
-                        "quarantining orphan {} to {}",
-                        path.display(),
-                        dest.display()
-                    )
-                })?;
-                warn!(from = %path.display(), to = %dest.display(), "quarantined unmatched lyric file");
-            }
-        }
-        OrphanAction::Delete => {
-            for path in lrc_files.values() {
-                fs::remove_file(path)
-                    .with_context(|| format!("deleting orphan {}", path.display()))?;
-                warn!(path = %path.display(), "deleted unmatched lyric file");
-            }
-        }
-    }
-    Ok(count)
-}
-
-fn write_lyrics(path: &Path, lyrics: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("lrc.tmp");
-    fs::write(&tmp, lyrics).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()));
-    }
-    Ok(())
-}
-
-fn is_audio_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|v| v.to_str())
-        .is_some_and(|ext| {
-            SUPPORTED_EXTENSIONS
-                .iter()
-                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
-        })
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-fn find_orphan_match<'a>(
-    audio_path: &Path,
-    lrc_names: impl Iterator<Item = &'a String>,
-) -> Option<String> {
-    let audio_name = file_name(audio_path);
-    let audio_track = track_number(&audio_name);
-    let audio_clean = clean_name(&audio_name);
-    let names: Vec<&String> = lrc_names.collect();
-
-    if let Some(audio_track) = audio_track {
-        if let Some(found) = names
-            .iter()
-            .copied()
-            .find(|name| track_number(name).is_some_and(|candidate| candidate == audio_track))
-        {
-            return Some(found.clone());
-        }
-    }
-
-    names
-        .iter()
-        .copied()
-        .find(|name| clean_name(name) == audio_clean)
-        .cloned()
-}
-
-fn track_number(name: &str) -> Option<u32> {
-    let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
+    let result = matches.next()?.clone();
+    if matches.next().is_some() {
         None
     } else {
-        digits.parse().ok()
+        Some(result)
     }
-}
-
-fn clean_name(name: &str) -> String {
-    let stem = Path::new(name)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy())
-        .unwrap_or_default();
-    let value = RE_LEADING.replace(&stem, "");
-    let value = RE_BRACKETED.replace_all(&value, "");
-    let value = RE_FEATURED.replace_all(&value, "");
-    RE_NON_WORD.replace_all(&value, "").to_ascii_lowercase()
-}
-
-#[derive(Default)]
-struct DirectoryFiles {
-    audio: Vec<PathBuf>,
-    lrc: HashMap<String, PathBuf>,
-}
-
-fn rel_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Response, TestServer, config, lyrics, tags, write_flac};
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tempfile::TempDir;
 
-    #[test]
-    fn test_is_audio_file() {
-        assert!(is_audio_file(Path::new("song.mp3")));
-        assert!(is_audio_file(Path::new("song.FLAC")));
-        assert!(is_audio_file(Path::new("song.m4a")));
-        assert!(is_audio_file(Path::new("song.ogg")));
-        assert!(is_audio_file(Path::new("song.opus")));
-        assert!(!is_audio_file(Path::new("song.lrc")));
-        assert!(!is_audio_file(Path::new("song.txt")));
-        assert!(!is_audio_file(Path::new("song")));
+    fn processor(config: Config, server: &TestServer) -> Processor {
+        let db = CacheDb::open(config.db_file.clone(), config.retry_not_found_days).unwrap();
+        let shutdown = Shutdown::default();
+        Processor::new(
+            config,
+            db,
+            LrclibClient::test_client(server.url.clone(), shutdown.clone()),
+            shutdown,
+        )
     }
 
     #[test]
-    fn test_track_number() {
-        assert_eq!(track_number("01 Song.mp3"), Some(1));
-        assert_eq!(track_number("12-Track.flac"), Some(12));
-        assert_eq!(track_number("Song.mp3"), None);
-        assert_eq!(track_number(""), None);
+    fn actual_metadata_fixture_parses_the_declared_recording() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("song.flac");
+        write_flac(&path, &tags());
+        assert_eq!(read_tags(&path).unwrap(), tags());
     }
 
     #[test]
-    fn test_clean_name() {
-        assert_eq!(clean_name("01 - Song Title.mp3"), "songtitle");
-        assert_eq!(clean_name("03. Hello World (feat. Artist).flac"), "helloworld");
-        assert_eq!(clean_name("Track [Remastered].mp3"), "track");
+    fn disappeared_directory_admission_does_not_stop_later_scan_work() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("disappeared");
+        let later = root.path().join("later");
+        fs::create_dir(&later).unwrap();
+        let queue = WorkQueue::new(2, Shutdown::default());
+        assert_eq!(queue_directories([missing, later.clone()], &queue), 1);
+        let item = queue.take().unwrap();
+        assert_eq!(item.physical_directory(), later);
+        queue.finish(item, false);
+        assert!(queue.idle());
     }
 
     #[test]
-    fn test_find_orphan_match_by_track_number() {
-        let lrc_names = vec!["01 - Different Name.lrc".to_string()];
-        let result = find_orphan_match(
-            Path::new("01 - Song.mp3"),
-            lrc_names.iter(),
+    fn uppercase_sidecars_are_paired_in_every_orphan_mode() {
+        for action in [
+            OrphanAction::Keep,
+            OrphanAction::Reconcile,
+            OrphanAction::Quarantine,
+            OrphanAction::Delete,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let audio = dir.path().join("song.flac");
+            write_flac(&audio, &tags());
+            let sidecar = dir.path().join("song.LRC");
+            fs::write(&sidecar, "curated lyrics").unwrap();
+            let server = TestServer::new(|_| panic!("paired sidecar must not request lyrics"));
+            let mut config = config(dir.path());
+            config.orphan_action = action;
+            processor(config, &server)
+                .process_directory(dir.path())
+                .unwrap();
+            assert_eq!(files::read_lyrics(&sidecar).unwrap(), "curated lyrics");
+            assert!(!dir.path().join(files::QUARANTINE).exists());
+        }
+    }
+
+    #[test]
+    fn edited_lyrics_are_restored_after_deletion() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("song.flac");
+        write_flac(&audio, &tags());
+        let lrc = audio.with_extension("lrc");
+        fs::write(&lrc, "original lyrics").unwrap();
+        let server = TestServer::new(|_| panic!("restoration uses the edited cache"));
+        let processor = processor(config(dir.path()), &server);
+        processor.process_directory(dir.path()).unwrap();
+        fs::write(&lrc, "corrected lyrics").unwrap();
+        processor.process_directory(dir.path()).unwrap();
+        fs::remove_file(&lrc).unwrap();
+        processor.process_directory(dir.path()).unwrap();
+        assert_eq!(files::read_lyrics(&lrc).unwrap(), "corrected lyrics");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_aliases_preserve_provenance_when_audio_is_retagged() {
+        let root = TempDir::new().unwrap();
+        let album = root.path().join("album");
+        let alias = root.path().join("alias");
+        let audio = album.join("song.flac");
+        write_flac(&audio, &tags());
+        std::os::unix::fs::symlink(&album, &alias).unwrap();
+        let server = TestServer::new(|request| {
+            let mut track = tags();
+            track.artist = request.query["artist_name"].clone();
+            let text = if track.artist == "Corrected Artist" {
+                "new recording"
+            } else {
+                "old recording"
+            };
+            Response::json(200, lyrics(&track, text))
+        });
+        let mut settings = config(root.path());
+        settings.follow_symlinks = true;
+        let processor = processor(settings, &server);
+        processor.process_directory(&album).unwrap();
+        processor.process_directory(&alias).unwrap();
+        let mut corrected = tags();
+        corrected.artist = "Corrected Artist".into();
+        write_flac(&audio, &corrected);
+        processor.process_directory(&alias).unwrap();
+        assert_eq!(
+            files::read_lyrics(&audio.with_extension("lrc")).unwrap(),
+            "new recording"
         );
-        assert_eq!(result, Some("01 - Different Name.lrc".to_string()));
-    }
-
-    #[test]
-    fn test_find_orphan_match_by_clean_name() {
-        let lrc_names = vec!["Song Title.lrc".to_string()];
-        let result = find_orphan_match(
-            Path::new("Song Title.mp3"),
-            lrc_names.iter(),
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            files::read_lyrics(&album.join(files::QUARANTINE).join("song.lrc")).unwrap(),
+            "old recording"
         );
-        assert_eq!(result, Some("Song Title.lrc".to_string()));
     }
 
     #[test]
-    fn test_find_orphan_no_match() {
-        let lrc_names = vec!["Completely Different.lrc".to_string()];
-        let result = find_orphan_match(
-            Path::new("My Song.mp3"),
-            lrc_names.iter(),
+    fn retagging_a_cached_miss_reaches_the_http_lookup() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("song.flac");
+        write_flac(&audio, &tags());
+        let server = TestServer::new(|request| {
+            if request
+                .query
+                .get("artist_name")
+                .is_some_and(|artist| artist == "Corrected Artist")
+            {
+                let mut tags = tags();
+                tags.artist = "Corrected Artist".into();
+                Response::json(200, lyrics(&tags, "correct recording"))
+            } else {
+                Response::json(404, serde_json::json!({}))
+            }
+        });
+        let processor = processor(config(dir.path()), &server);
+        processor.process_directory(dir.path()).unwrap();
+        let mut corrected = tags();
+        corrected.artist = "Corrected Artist".into();
+        write_flac(&audio, &corrected);
+        processor.process_directory(dir.path()).unwrap();
+        assert_eq!(
+            files::read_lyrics(&audio.with_extension("lrc")).unwrap(),
+            "correct recording"
         );
-        assert_eq!(result, None);
     }
 
     #[test]
-    fn test_rel_path_strips_prefix() {
-        let path = Path::new("/music/Artist/Album/song.mp3");
-        let root = Path::new("/music");
-        assert_eq!(rel_path(path, root), "Artist/Album/song.mp3");
+    fn ambiguous_search_never_writes_or_caches_a_miss() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("song.flac");
+        write_flac(&audio, &tags());
+        let server = TestServer::new(|request| {
+            if request.path == "/get" {
+                return Response::json(404, serde_json::json!({}));
+            }
+            let mut record = tags();
+            record.album = "Other Album".into();
+            Response::json(
+                200,
+                serde_json::json!([lyrics(&record, "first"), lyrics(&record, "second")]),
+            )
+        });
+        let processor = processor(config(dir.path()), &server);
+        processor.process_directory(dir.path()).unwrap();
+        assert!(!audio.with_extension("lrc").exists());
+        assert!(processor.inner.db.record(&audio).unwrap().is_none());
     }
 
     #[test]
-    fn test_rel_path_no_prefix() {
-        let path = Path::new("/other/song.mp3");
-        let root = Path::new("/music");
-        assert_eq!(rel_path(path, root), "/other/song.mp3");
+    fn artist_changes_during_lookup_cannot_publish_stale_lyrics() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("song.flac");
+        write_flac(&audio, &tags());
+        let path = audio.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let reached = barrier.clone();
+        let server = TestServer::new(move |_| {
+            reached.wait();
+            reached.wait();
+            Response::json(200, lyrics(&tags(), "stale recording"))
+        });
+        let processor = processor(config(dir.path()), &server);
+        let worker = processor.clone();
+        let directory = dir.path().to_owned();
+        let handle = std::thread::spawn(move || worker.process_directory(&directory).unwrap());
+        barrier.wait();
+        let mut updated = tags();
+        updated.artist = "Replacement Artist".into();
+        write_flac(&path, &updated);
+        barrier.wait();
+        assert!(handle.join().unwrap());
+        assert!(!audio.with_extension("lrc").exists());
+        assert!(processor.inner.db.record(&audio).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_curated_file_created_during_lookup_is_preserved() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("song.flac");
+        write_flac(&audio, &tags());
+        let lrc = audio.with_extension("lrc");
+        let path = lrc.clone();
+        let server = TestServer::new(move |_| {
+            fs::write(&path, "curated while fetching").unwrap();
+            Response::json(200, lyrics(&tags(), "downloaded"))
+        });
+        let processor = processor(config(dir.path()), &server);
+        processor.process_directory(dir.path()).unwrap();
+        assert_eq!(files::read_lyrics(&lrc).unwrap(), "curated while fetching");
+    }
+
+    #[test]
+    fn conflicting_formats_sharing_a_stem_are_not_silently_assigned_one_recording() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("song.flac");
+        write_flac(&first, &tags());
+        let second = dir.path().join("song.mp3");
+        fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/whitespace-artist.mp3"
+            ),
+            &second,
+        )
+        .unwrap();
+        let server =
+            TestServer::new(|_| panic!("conflicting recording identity must not be fetched"));
+        processor(config(dir.path()), &server)
+            .process_directory(dir.path())
+            .unwrap();
+        assert!(!first.with_extension("lrc").exists());
+    }
+
+    #[test]
+    fn repeated_quarantine_scans_do_not_walk_the_archive() {
+        let dir = TempDir::new().unwrap();
+        let orphan = dir.path().join("orphan.lrc");
+        fs::write(&orphan, "first").unwrap();
+        let server = TestServer::new(|_| panic!("no audio"));
+        let mut config = config(dir.path());
+        config.orphan_action = OrphanAction::Quarantine;
+        let processor = processor(config.clone(), &server);
+        processor.process_directory(dir.path()).unwrap();
+        let queue = WorkQueue::new(4, Shutdown::default());
+        assert_eq!(queue_library(&config, &queue).unwrap(), 1);
+        let item = queue.take().unwrap();
+        processor.process_directory(&item.directory).unwrap();
+        queue.finish(item, false);
+        assert!(
+            !dir.path()
+                .join(files::QUARANTINE)
+                .join(files::QUARANTINE)
+                .exists()
+        );
+        fs::write(&orphan, "second").unwrap();
+        processor.process_directory(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_dir(dir.path().join(files::QUARANTINE))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn reconciliation_requires_unique_title_agreement_and_preserves_variants() {
+        let names = [
+            OsString::from("01 - Unrelated Song"),
+            OsString::from("01 - Correct Song"),
+        ];
+        assert_eq!(
+            unique_orphan_match(OsStr::new("Correct Song"), names.iter()),
+            Some(names[1].clone())
+        );
+        assert_eq!(
+            unique_orphan_match(OsStr::new("01 - Other Song"), names.iter()),
+            None
+        );
+        assert_eq!(
+            unique_orphan_match(OsStr::new("Correct Song (Live)"), names.iter()),
+            None
+        );
+        let duplicate = [
+            OsString::from("01 - Correct Song"),
+            OsString::from("Correct Song"),
+        ];
+        assert_eq!(
+            unique_orphan_match(OsStr::new("Correct Song"), duplicate.iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn reconciliation_runs_only_for_one_recording_and_one_title() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("Correct Song.flac");
+        let mut track = tags();
+        track.title = "Correct Song".into();
+        write_flac(&first, &track);
+        let orphan = dir.path().join("01 - Correct Song.lrc");
+        fs::write(&orphan, "curated match").unwrap();
+        let unrelated = dir.path().join("01 - Unrelated Song.lrc");
+        fs::write(&unrelated, "wrong title").unwrap();
+        let server = TestServer::new(|_| panic!("reconciled lyrics are curated"));
+        let mut settings = config(dir.path());
+        settings.orphan_action = OrphanAction::Reconcile;
+        processor(settings.clone(), &server)
+            .process_directory(dir.path())
+            .unwrap();
+        assert_eq!(
+            files::read_lyrics(&first.with_extension("lrc")).unwrap(),
+            "curated match"
+        );
+        assert!(unrelated.exists());
+        assert!(!orphan.exists());
+        fs::remove_file(first.with_extension("lrc")).unwrap();
+        fs::write(&orphan, "ambiguous match").unwrap();
+        let mut other = track;
+        other.artist = "Different Artist".into();
+        write_flac(&dir.path().join("Correct Song.mp3"), &other);
+        processor(settings, &server)
+            .process_directory(dir.path())
+            .unwrap();
+        assert!(orphan.exists());
+        assert!(!first.with_extension("lrc").exists());
+    }
+
+    #[test]
+    fn bad_metadata_does_not_delay_a_ready_track() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a-broken.mp3"), "unfinished").unwrap();
+        let good = dir.path().join("z-good.flac");
+        write_flac(&good, &tags());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let server = TestServer::new(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Response::json(200, lyrics(&tags(), "ready track"))
+        });
+        processor(config(dir.path()), &server)
+            .process_directory(dir.path())
+            .unwrap();
+        assert_eq!(
+            files::read_lyrics(&good.with_extension("lrc")).unwrap(),
+            "ready track"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 }
