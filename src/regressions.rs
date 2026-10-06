@@ -441,6 +441,48 @@ fn stale_running_route_repairs_its_original_owner_without_entering_an_archive() 
 }
 
 #[test]
+fn preserved_mtime_does_not_hide_retagging_or_manual_lyric_edits() {
+    let root = TempDir::new().unwrap();
+    let audio = root.path().join("song.flac");
+    let sidecar = audio.with_extension("lrc");
+    write_flac(&audio, &tags());
+    fs::write(&sidecar, "curated lyrics").unwrap();
+    let settings = config(root.path());
+    let server = TestServer::new(|_| panic!("curated lyrics do not require HTTP"));
+    let worker = processor(&settings, &server);
+    worker.process_directory(root.path()).unwrap();
+    let audio_modified = fs::metadata(&audio).unwrap().modified().unwrap();
+    let lyric_modified = fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let mut corrected = tags();
+    corrected.artist = "Corrected Artist".into();
+    write_flac(&audio, &corrected);
+    fs::File::open(&audio)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(audio_modified))
+        .unwrap();
+    fs::write(&sidecar, "edited lyrics").unwrap();
+    fs::File::open(&sidecar)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(lyric_modified))
+        .unwrap();
+    // Reopening the processor also proves the file cache persists across daemon restarts.
+    let worker = processor(&settings, &server);
+    worker.process_directory(root.path()).unwrap();
+    let cache = CacheDb::open(settings.db_file, 7).unwrap();
+    assert_eq!(
+        cache.record(&audio).unwrap().unwrap().tags,
+        corrected.normalized()
+    );
+    assert_eq!(
+        cache.cached(&audio, &corrected).unwrap(),
+        Some(CachedResult::Found {
+            lyrics: "edited lyrics".into(),
+            origin: Origin::Curated,
+        })
+    );
+}
+
+#[test]
 fn repeated_scans_preserve_a_miss_timestamp_until_the_lookup_expires() {
     let root = TempDir::new().unwrap();
     let audio = root.path().join("song.flac");

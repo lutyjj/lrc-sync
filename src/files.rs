@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use tempfile::NamedTempFile;
 
 use crate::config::Config;
@@ -74,7 +75,7 @@ fn within_archive(path: &Path) -> bool {
         .any(|component| component.as_os_str() == QUARANTINE)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileStamp {
     length: u64,
     modified: SystemTime,
@@ -82,12 +83,38 @@ pub struct FileStamp {
     inode: u64,
     #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
 }
 
 impl FileStamp {
+    pub fn identity(&self) -> Option<[u8; 16]> {
+        #[cfg(unix)]
+        {
+            let mut identity = [0; 16];
+            identity[..8].copy_from_slice(&self.device.to_be_bytes());
+            identity[8..].copy_from_slice(&self.inode.to_be_bytes());
+            Some(identity)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let metadata = fs::metadata(path)
             .with_context(|| format!("reading metadata for {}", path.display()))?;
+        Self::from_metadata(path, metadata)
+    }
+
+    pub fn read_sidecar(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("reading sidecar metadata for {}", path.display()))?;
+        Self::from_metadata(path, metadata)
+    }
+
+    fn from_metadata(path: &Path, metadata: fs::Metadata) -> Result<Self> {
         if !metadata.is_file() {
             bail!("{} is not a regular file", path.display());
         }
@@ -100,6 +127,8 @@ impl FileStamp {
             inode: metadata.ino(),
             #[cfg(unix)]
             device: metadata.dev(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
     }
 }

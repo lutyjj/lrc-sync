@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::tags::TrackTags;
+use crate::{files::FileStamp, tags::TrackTags};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -75,7 +75,29 @@ impl CacheDb {
                 duration INTEGER NOT NULL,
                 lyrics TEXT NOT NULL CHECK(length(lyrics) > 0),
                 origin TEXT NOT NULL CHECK(origin IN ('generated','curated'))
-             );"
+             );
+             CREATE TABLE IF NOT EXISTS audio_tags (
+                path BLOB PRIMARY KEY,
+                stamp BLOB NOT NULL,
+                artist TEXT NOT NULL,
+                title TEXT NOT NULL,
+                album TEXT NOT NULL,
+                duration INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS lyric_files (
+                path BLOB PRIMARY KEY,
+                stamp BLOB NOT NULL,
+                lyrics TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS file_versions (
+                path BLOB PRIMARY KEY,
+                version INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS file_identities (
+                path BLOB PRIMARY KEY,
+                identity BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS files_by_identity ON file_identities(identity);"
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -83,6 +105,179 @@ impl CacheDb {
                 .checked_mul(86_400)
                 .context("cache retry interval overflow")?,
         })
+    }
+
+    /// Native writes are stronger evidence than an unchanged metadata stamp.
+    pub fn invalidate_files(&self, paths: &[PathBuf]) -> Result<()> {
+        let mut conn = self.conn.lock().expect("cache lock poisoned");
+        let tx = conn.transaction()?;
+        for path in paths {
+            tx.execute(
+                "INSERT INTO file_versions(path,version) VALUES(?1,1)
+                 ON CONFLICT(path) DO UPDATE SET version=version+1",
+                [path.as_os_str().as_encoded_bytes()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn invalidate_file(&self, path: &Path) -> Result<()> {
+        self.invalidate_files(&[path.to_owned()])
+    }
+
+    pub fn file_version(&self, path: &Path) -> Result<i64> {
+        Ok(self.conn.lock().expect("cache lock poisoned").query_row(
+            "SELECT coalesce(sum(version),0) FROM file_versions WHERE path=?1 OR path=X''",
+            [path.as_os_str().as_encoded_bytes()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn invalidate_all_snapshots(&self) -> Result<()> {
+        // Absolute file paths cannot collide with the empty key reserved for the library epoch.
+        self.invalidate_file(Path::new(""))
+    }
+
+    pub fn paths_sharing_file(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        #[cfg(unix)]
+        {
+            use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+            let current = FileStamp::read(path)
+                .ok()
+                .and_then(|stamp| stamp.identity());
+            let conn = self.conn.lock().expect("cache lock poisoned");
+            let identity = match current {
+                Some(identity) => Some(identity.to_vec()),
+                None => conn
+                    .query_row(
+                        "SELECT identity FROM file_identities WHERE path=?1",
+                        [path.as_os_str().as_encoded_bytes()],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?,
+            };
+            let Some(identity) = identity else {
+                return Ok(Vec::new());
+            };
+            let mut query = conn.prepare("SELECT path FROM file_identities WHERE identity=?1")?;
+            Ok(query
+                .query_map([identity], |row| {
+                    Ok(PathBuf::from(OsString::from_vec(row.get(0)?)))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(Vec::new())
+        }
+    }
+
+    fn index_file(conn: &Connection, path: &Path, stamp: &FileStamp) -> Result<()> {
+        if let Some(identity) = stamp.identity() {
+            conn.execute(
+                "INSERT INTO file_identities(path,identity) VALUES(?1,?2)
+                ON CONFLICT(path) DO UPDATE SET identity=excluded.identity
+                WHERE file_identities.identity!=excluded.identity",
+                params![path.as_os_str().as_encoded_bytes(), identity.as_slice()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn cached_tags(
+        &self,
+        path: &Path,
+        stamp: &FileStamp,
+        version: i64,
+    ) -> Result<Option<TrackTags>> {
+        if !cfg!(unix) {
+            return Ok(None);
+        }
+        let stamp = serde_json::to_vec(&(stamp, version))?;
+        let conn = self.conn.lock().expect("cache lock poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT artist,title,album,duration FROM audio_tags WHERE path=?1 AND stamp=?2",
+                params![path.as_os_str().as_encoded_bytes(), stamp],
+                |row| {
+                    Ok(TrackTags {
+                        artist: row.get(0)?,
+                        title: row.get(1)?,
+                        album: row.get(2)?,
+                        duration_secs: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn store_tags(
+        &self,
+        path: &Path,
+        stamp: &FileStamp,
+        version: i64,
+        tags: &TrackTags,
+    ) -> Result<()> {
+        if !cfg!(unix) {
+            return Ok(());
+        }
+        let fingerprint = serde_json::to_vec(&(stamp, version))?;
+        let mut conn = self.conn.lock().expect("cache lock poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO audio_tags(path,stamp,artist,title,album,duration) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,artist=excluded.artist,
+                 title=excluded.title,album=excluded.album,duration=excluded.duration",
+            params![path.as_os_str().as_encoded_bytes(), fingerprint, tags.artist, tags.title, tags.album, tags.duration_secs],
+        )?;
+        Self::index_file(&tx, path, stamp)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn cached_lyric_file(
+        &self,
+        path: &Path,
+        stamp: &FileStamp,
+        version: i64,
+    ) -> Result<Option<String>> {
+        if !cfg!(unix) {
+            return Ok(None);
+        }
+        let stamp = serde_json::to_vec(&(stamp, version))?;
+        let conn = self.conn.lock().expect("cache lock poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT lyrics FROM lyric_files WHERE path=?1 AND stamp=?2",
+                params![path.as_os_str().as_encoded_bytes(), stamp],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn store_lyric_file(
+        &self,
+        path: &Path,
+        stamp: &FileStamp,
+        version: i64,
+        lyrics: &str,
+    ) -> Result<()> {
+        if !cfg!(unix) {
+            return Ok(());
+        }
+        let fingerprint = serde_json::to_vec(&(stamp, version))?;
+        let mut conn = self.conn.lock().expect("cache lock poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO lyric_files(path,stamp,lyrics) VALUES(?1,?2,?3)
+             ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,lyrics=excluded.lyrics",
+            params![path.as_os_str().as_encoded_bytes(), fingerprint, lyrics],
+        )?;
+        Self::index_file(&tx, path, stamp)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn record(&self, path: &Path) -> Result<Option<TrackRecord>> {
@@ -233,9 +428,20 @@ impl CacheDb {
     }
 
     pub fn ingest(&self, path: &Path, tags: &TrackTags, lyrics: &str) -> Result<()> {
+        let normalized = tags.normalized();
         let origin = match self.sidecar_record(&path.with_extension("lrc"))? {
-            Some(record) if record.tags == tags.normalized() && record.lyrics == lyrics => {
-                record.origin
+            Some(sidecar) if sidecar.tags == normalized && sidecar.lyrics == lyrics => {
+                if self.record(path)?.is_some_and(|record| {
+                    record.tags == normalized
+                        && record.result
+                            == CachedResult::Found {
+                                lyrics: lyrics.to_owned(),
+                                origin: sidecar.origin,
+                            }
+                }) {
+                    return Ok(());
+                }
+                sidecar.origin
             }
             _ => Origin::Curated,
         };
@@ -269,6 +475,47 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = CacheDb::open(dir.path().join("cache.sqlite3"), 7).unwrap();
         (dir, db)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notified_writes_survive_restart_and_reject_late_snapshot_commits() {
+        let (directory, cache) = db();
+        let file = directory.path().join("song.flac");
+        fs::write(&file, "metadata fixture").unwrap();
+        let stamp = FileStamp::read(&file).unwrap();
+        cache.store_tags(&file, &stamp, 0, &tags()).unwrap();
+        cache
+            .store_lyric_file(&file, &stamp, 0, "manual lyrics")
+            .unwrap();
+        cache.invalidate_file(&file).unwrap();
+        drop(cache);
+        let cache = CacheDb::open(directory.path().join("cache.sqlite3"), 7).unwrap();
+        let version = cache.file_version(&file).unwrap();
+        assert_eq!(cache.cached_tags(&file, &stamp, version).unwrap(), None);
+        assert_eq!(
+            cache.cached_lyric_file(&file, &stamp, version).unwrap(),
+            None
+        );
+        cache.invalidate_file(&file).unwrap();
+        // A reader that started before this write may finish afterward, using its old version.
+        cache.store_tags(&file, &stamp, version, &tags()).unwrap();
+        assert_eq!(
+            cache
+                .cached_tags(&file, &stamp, cache.file_version(&file).unwrap())
+                .unwrap(),
+            None
+        );
+        let unrelated = directory.path().join("unrelated.flac");
+        cache.store_tags(&unrelated, &stamp, 0, &tags()).unwrap();
+        assert!(cache.cached_tags(&unrelated, &stamp, 0).unwrap().is_some());
+        cache.invalidate_all_snapshots().unwrap();
+        assert_eq!(
+            cache
+                .cached_tags(&unrelated, &stamp, cache.file_version(&unrelated).unwrap())
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -348,6 +595,25 @@ mod tests {
             db.cached(Path::new("a.flac"), &track).unwrap(),
             Some(CachedResult::Found { .. })
         ));
+    }
+
+    #[test]
+    fn identical_ingestion_leaves_the_database_untouched() {
+        let (_dir, db) = db();
+        let path = Path::new("song.flac");
+        db.ingest(path, &tags(), "curated lyrics").unwrap();
+        let before = db.conn.lock().unwrap().total_changes();
+        db.ingest(path, &tags(), "curated lyrics").unwrap();
+        assert_eq!(db.conn.lock().unwrap().total_changes(), before);
+        db.ingest(path, &tags(), "edited lyrics").unwrap();
+        assert!(db.conn.lock().unwrap().total_changes() > before);
+        assert_eq!(
+            db.cached(path, &tags()).unwrap(),
+            Some(CachedResult::Found {
+                lyrics: "edited lyrics".into(),
+                origin: Origin::Curated
+            })
+        );
     }
 
     #[test]
