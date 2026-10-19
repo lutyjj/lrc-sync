@@ -36,37 +36,13 @@ pub fn start(
         return start_poll(config, queue, shutdown);
     }
     let (tx, rx) = mpsc::sync_channel(256);
-    let overflow = queue.clone();
     let watch_lost = Arc::new(AtomicBool::new(false));
-    let callback_watch_lost = watch_lost.clone();
-    let root = config.music_dir.clone();
-    let callback = move |event: notify::Result<Event>| {
-        if event.as_ref().is_ok_and(Event::need_rescan) {
-            // Lost directory-create events can leave gaps in recursive watch coverage.
-            // This signal must survive a full application channel too.
-            warn!("native event overflow; filesystem watch coverage lost");
-            callback_watch_lost.store(true, Ordering::Relaxed);
-            return;
-        }
-        if event.as_ref().is_ok_and(|event| {
-            event.paths.iter().any(|path| path == &root)
-                && matches!(
-                    event.kind,
-                    EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-                )
-        }) {
-            // Watch loss must survive a full change channel.
-            callback_watch_lost.store(true, Ordering::Relaxed);
-            return;
-        }
-        // Readers generate native access events too; they must not fill the change channel.
-        if event.as_ref().is_ok_and(|event| !is_change(event)) {
-            return;
-        }
-        if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(event) {
-            overflow.request_repair();
-        }
-    };
+    let callback = native_callback(
+        config.music_dir.clone(),
+        tx,
+        queue.clone(),
+        watch_lost.clone(),
+    );
     let options = NotifyConfig::default()
         .with_follow_symlinks(config.follow_symlinks)
         .with_poll_interval(config.poll_interval);
@@ -91,7 +67,7 @@ pub fn start(
                     break;
                 }
                 match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Ok(mut event)) => {
+                    Ok(mut event) => {
                         if matches!(
                             event.kind,
                             EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any)
@@ -129,19 +105,55 @@ pub fn start(
                         }
                         dispatch(&config, &queue, event);
                     }
-                    Ok(Err(err)) => {
-                        warn!(error = %err, "filesystem event failed; requesting repair scan");
-                        queue.request_repair();
-                        if config.fallback_interval.is_none() {
-                            break;
-                        }
-                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         })
         .context("starting watcher dispatcher")
+}
+
+fn native_callback(
+    root: PathBuf,
+    tx: mpsc::SyncSender<Event>,
+    queue: Arc<WorkQueue>,
+    watch_lost: Arc<AtomicBool>,
+) -> impl FnMut(notify::Result<Event>) {
+    move |event: notify::Result<Event>| {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                // Failed recursive registration can leave unwatched directories.
+                warn!(error = %err, "native backend failed; filesystem watch coverage lost");
+                watch_lost.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        if event.need_rescan() {
+            // Lost directory-create events can leave gaps in recursive watch coverage.
+            // This signal must survive a full application channel too.
+            warn!("native event overflow; filesystem watch coverage lost");
+            watch_lost.store(true, Ordering::Relaxed);
+            return;
+        }
+        if event.paths.iter().any(|path| path == &root)
+            && matches!(
+                event.kind,
+                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+            )
+        {
+            // Watch loss must survive a full change channel.
+            watch_lost.store(true, Ordering::Relaxed);
+            return;
+        }
+        // Readers generate native access events too; they must not fill the change channel.
+        if !is_change(&event) {
+            return;
+        }
+        if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(event) {
+            queue.request_repair();
+        }
+    }
 }
 
 fn metadata_snapshot(config: &Config) -> Result<BTreeMap<PathBuf, FileStamp>> {
@@ -270,6 +282,41 @@ mod tests {
     use crate::test_support::{config, tags, write_flac};
     use notify::event::{AccessKind, AccessMode, CreateKind, MetadataKind, RemoveKind};
     use tempfile::TempDir;
+
+    #[test]
+    fn watch_loss_signals_survive_a_saturated_change_channel() {
+        for cause in 0..3 {
+            let root = TempDir::new().unwrap();
+            let queue = Arc::new(WorkQueue::new(1, Shutdown::default()));
+            let lost = Arc::new(AtomicBool::new(false));
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let mut callback =
+                native_callback(root.path().to_owned(), tx, queue.clone(), lost.clone());
+            for name in ["first.flac", "second.flac"] {
+                callback(Ok(Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(root.path().join(name))));
+            }
+            assert!(
+                queue.take_repair_request(),
+                "fixture must fill the change channel"
+            );
+            assert!(
+                !lost.load(Ordering::Relaxed),
+                "ordinary queue pressure only needs content repair"
+            );
+            let failure = match cause {
+                0 => Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+                1 => Ok(Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+                _ => Ok(Event::new(EventKind::Remove(RemoveKind::Folder))
+                    .add_path(root.path().to_owned())),
+            };
+            callback(failure);
+            assert!(
+                lost.load(Ordering::Relaxed),
+                "watch loss must survive a full channel (cause {cause})"
+            );
+        }
+    }
 
     #[test]
     fn reads_and_directory_timestamps_do_not_request_library_work() {

@@ -233,7 +233,10 @@ fn unchanged_audio_is_not_opened(mode: &str, idle: Duration) {
     let mut observer = RecommendedWatcher::new(
         move |event: notify::Result<Event>| {
             if let Ok(event) = event
-                && matches!(event.kind, EventKind::Access(_))
+                && matches!(
+                    event.kind,
+                    EventKind::Access(notify::event::AccessKind::Open(_))
+                )
             {
                 let _ = tx.send(event);
             }
@@ -318,7 +321,10 @@ fn startup_reconciliation_reuses_file_cache_without_reopening_unchanged_files() 
         let mut observer = RecommendedWatcher::new(
             move |event: notify::Result<Event>| {
                 if let Ok(event) = event
-                    && matches!(event.kind, EventKind::Access(_))
+                    && matches!(
+                        event.kind,
+                        EventKind::Access(notify::event::AccessKind::Open(_))
+                    )
                 {
                     let _ = tx.send(event);
                 }
@@ -535,7 +541,10 @@ fn check_write_close(hardlinked: bool) {
     let mut observer = RecommendedWatcher::new(
         move |event: notify::Result<Event>| {
             if let Ok(event) = event
-                && matches!(event.kind, EventKind::Access(_))
+                && matches!(
+                    event.kind,
+                    EventKind::Access(notify::event::AccessKind::Open(_))
+                )
             {
                 let _ = tx.send(event);
             }
