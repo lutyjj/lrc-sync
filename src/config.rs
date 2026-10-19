@@ -41,7 +41,8 @@ pub struct Config {
     pub request_timeout: Duration,
     pub orphan_action: OrphanAction,
     pub follow_symlinks: bool,
-    pub fallback_interval: Duration,
+    pub startup_scan: bool,
+    pub fallback_interval: Option<Duration>,
     pub watch_mode: WatchMode,
     pub poll_interval: Duration,
     pub max_pending_dirs: usize,
@@ -75,14 +76,15 @@ impl Config {
                 &env::var("LRCSYNC_ORPHAN_ACTION").unwrap_or_else(|_| "keep".to_string()),
             )?,
             follow_symlinks: parse_bool("LRCSYNC_FOLLOW_SYMLINKS", false)?,
-            fallback_interval: Duration::from_secs(parse_u64(
+            startup_scan: parse_bool("LRCSYNC_STARTUP_SCAN", true)?,
+            fallback_interval: scan_interval(parse_u64(
                 "LRCSYNC_FALLBACK_SCAN_SECONDS",
-                300,
-                60,
+                0,
+                0,
                 604_800,
-            )?),
+            )?)?,
             watch_mode: match env::var("LRCSYNC_WATCH_MODE")
-                .unwrap_or_else(|_| "poll".into())
+                .unwrap_or_else(|_| "native".into())
                 .trim()
                 .to_lowercase()
                 .as_str()
@@ -99,6 +101,14 @@ impl Config {
             )?),
             max_pending_dirs: parse_usize("LRCSYNC_MAX_PENDING_DIRS", 128, 1, 4096)?,
         })
+    }
+}
+
+fn scan_interval(seconds: u64) -> Result<Option<Duration>> {
+    match seconds {
+        0 => Ok(None),
+        60..=604_800 => Ok(Some(Duration::from_secs(seconds))),
+        _ => bail!("LRCSYNC_FALLBACK_SCAN_SECONDS must be 0 (disabled) or between 60 and 604800"),
     }
 }
 
@@ -142,5 +152,18 @@ fn parse_bool(name: &str, default: bool) -> Result<bool> {
             _ => bail!("{name} must be a boolean"),
         },
         _ => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_scans_can_be_disabled_without_accepting_short_scan_loops() {
+        assert_eq!(scan_interval(0).unwrap(), None);
+        assert_eq!(scan_interval(60).unwrap(), Some(Duration::from_secs(60)));
+        assert!(scan_interval(1).is_err());
+        assert!(scan_interval(604_801).is_err());
     }
 }

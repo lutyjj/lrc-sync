@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
@@ -40,23 +40,33 @@ struct ProcessorInner {
     db: CacheDb,
     lrclib: LrclibClient,
     shutdown: Shutdown,
+    queue: Arc<WorkQueue>,
 }
 
 struct Audio {
     path: PathBuf,
+    physical_path: PathBuf,
     cache_path: PathBuf,
     tags: TrackTags,
     stamp: FileStamp,
+    version: i64,
 }
 
 impl Processor {
-    pub fn new(config: Config, db: CacheDb, lrclib: LrclibClient, shutdown: Shutdown) -> Self {
+    pub fn new(
+        config: Config,
+        db: CacheDb,
+        lrclib: LrclibClient,
+        shutdown: Shutdown,
+        queue: Arc<WorkQueue>,
+    ) -> Self {
         Self {
             inner: Arc::new(ProcessorInner {
                 config,
                 db,
                 lrclib,
                 shutdown,
+                queue,
             }),
         }
     }
@@ -81,6 +91,7 @@ impl Processor {
             self.inner.db.clone(),
             self.inner.lrclib.clone(),
             self.inner.shutdown.clone(),
+            self.inner.queue.clone(),
         )
         .process_directory(work.physical_directory())?;
         Ok(if changed {
@@ -178,19 +189,10 @@ impl Processor {
     fn process_group(&self, paths: &[PathBuf], existing: Option<&Path>) -> Result<bool> {
         let mut audio = Vec::new();
         for path in paths {
-            let stamp = FileStamp::read(path)?;
-            let tags = read_tags(path)?;
-            if FileStamp::read(path)? != stamp {
+            let Some(item) = self.audio(path)? else {
                 return Ok(true);
-            }
-            audio.push(Audio {
-                path: path.clone(),
-                // Cache ownership follows the sidecar's physical directory. File symlink
-                // names retain distinct sidecars, while directory aliases share provenance.
-                cache_path: cache_path(path)?,
-                tags,
-                stamp,
-            });
+            };
+            audio.push(item);
         }
         let tags = &audio[0].tags;
         if audio
@@ -205,7 +207,7 @@ impl Processor {
             return Ok(false);
         }
         if let Some(path) = existing {
-            let lyrics = files::read_lyrics(path)?;
+            let lyrics = self.lyrics(path)?;
             let stale_generated = self
                 .inner
                 .db
@@ -317,7 +319,7 @@ impl Processor {
             warn!(path = %audio[0].path.display(), "preserving ambiguous or excluded sidecar collision");
             return Ok(());
         }
-        let lyrics = files::read_lyrics(&paths[0])?;
+        let lyrics = self.lyrics(&paths[0])?;
         for item in audio {
             self.inner.db.store(
                 &item.cache_path,
@@ -335,9 +337,83 @@ impl Processor {
         audio.iter().all(|item| {
             files::eligible(&self.inner.config, &item.path)
                 && FileStamp::read(&item.path).is_ok_and(|stamp| stamp == item.stamp)
-                && read_tags(&item.path)
-                    .is_ok_and(|tags| tags.normalized() == item.tags.normalized())
+                && self
+                    .inner
+                    .db
+                    .file_version(&item.physical_path)
+                    .is_ok_and(|version| version == item.version)
+                && (cfg!(unix)
+                    || read_tags(&item.path)
+                        .is_ok_and(|tags| tags.normalized() == item.tags.normalized()))
         })
+    }
+
+    fn audio(&self, path: &Path) -> Result<Option<Audio>> {
+        let stamp = FileStamp::read(path)?;
+        let physical = path.canonicalize()?;
+        let version = self.inner.db.file_version(&physical)?;
+        let cached = self.inner.db.cached_tags(&physical, &stamp, version)?;
+        let tags = match &cached {
+            Some(tags) => tags.clone(),
+            None => read_tags(path)?,
+        };
+        if FileStamp::read(path)? != stamp
+            || path.canonicalize()? != physical
+            || self.inner.db.file_version(&physical)? != version
+        {
+            return Ok(None);
+        }
+        if cached.is_none() {
+            let displaced = self
+                .inner
+                .db
+                .store_tags(&physical, &stamp, version, &tags)?;
+            self.queue_displaced(displaced);
+        }
+        Ok(Some(Audio {
+            path: path.to_owned(),
+            physical_path: physical,
+            cache_path: cache_path(path)?,
+            tags,
+            stamp,
+            version,
+        }))
+    }
+
+    fn lyrics(&self, path: &Path) -> Result<String> {
+        let stamp = FileStamp::read_sidecar(path)?;
+        let physical = cache_path(path)?;
+        let version = self.inner.db.file_version(&physical)?;
+        let cached = self
+            .inner
+            .db
+            .cached_lyric_file(&physical, &stamp, version)?;
+        let lyrics = match &cached {
+            Some(lyrics) => lyrics.clone(),
+            None => files::read_lyrics(path)?,
+        };
+        if FileStamp::read_sidecar(path)? != stamp
+            || cache_path(path)? != physical
+            || self.inner.db.file_version(&physical)? != version
+        {
+            bail!("sidecar changed while reading {}", path.display());
+        }
+        if cached.is_none() {
+            let displaced = self
+                .inner
+                .db
+                .store_lyric_file(&physical, &stamp, version, &lyrics)?;
+            self.queue_displaced(displaced);
+        }
+        Ok(lyrics)
+    }
+
+    fn queue_displaced(&self, paths: Vec<PathBuf>) {
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                self.inner.queue.submit(parent.to_owned(), false);
+            }
+        }
     }
 
     fn reconcile(
@@ -350,9 +426,14 @@ impl Processor {
             .filter_map(|(stem, paths)| {
                 let tags = paths
                     .iter()
-                    .map(|path| read_tags(path).map(|tags| tags.normalized()))
+                    .map(|path| {
+                        self.audio(path)
+                            .map(|item| item.map(|item| item.tags.normalized()))
+                    })
                     .collect::<Result<Vec<_>>>()
-                    .ok()?;
+                    .ok()?
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()?;
                 Some((stem, tags))
             })
             .collect();
@@ -392,7 +473,7 @@ impl Processor {
             if has_audio(&source)? {
                 continue;
             }
-            let Ok(lyrics) = files::read_lyrics(&source) else {
+            let Ok(lyrics) = self.lyrics(&source) else {
                 continue;
             };
             if let Some(record) = self
@@ -405,10 +486,11 @@ impl Processor {
                 // Generated content uses exact cache reuse under its new owner.
                 continue;
             }
-            if audio[*stem]
-                .iter()
-                .any(|path| !read_tags(path).is_ok_and(|current| current.normalized() == *tags))
-            {
+            if audio[*stem].iter().any(|path| {
+                !self
+                    .audio(path)
+                    .is_ok_and(|item| item.is_some_and(|item| item.tags.normalized() == *tags))
+            }) {
                 continue;
             }
             if files::move_new(&source, &destination)? {
@@ -527,11 +609,68 @@ mod tests {
         let db = CacheDb::open(config.db_file.clone(), config.retry_not_found_days).unwrap();
         let shutdown = Shutdown::default();
         Processor::new(
-            config,
+            config.clone(),
             db,
             LrclibClient::test_client(server.url.clone(), shutdown.clone()),
-            shutdown,
+            shutdown.clone(),
+            Arc::new(WorkQueue::new(config.max_pending_dirs, shutdown)),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_before_write_dispatch_transfers_the_displaced_hardlink_work() {
+        let root = TempDir::new().unwrap();
+        let a = root.path().join("a/song.flac");
+        let b = root.path().join("b/song.flac");
+        for audio in [&a, &b] {
+            write_flac(audio, &tags());
+        }
+        fs::write(a.with_extension("lrc"), "original lyrics").unwrap();
+        fs::hard_link(a.with_extension("lrc"), b.with_extension("lrc")).unwrap();
+        let server = TestServer::new(|_| panic!("curated sidecars never require HTTP"));
+        let processor = processor(config(root.path()), &server);
+        for audio in [&a, &b] {
+            processor
+                .process_directory(audio.parent().unwrap())
+                .unwrap();
+        }
+        assert!(processor.inner.queue.idle());
+        let version = processor
+            .inner
+            .db
+            .file_version(&b.with_extension("lrc"))
+            .unwrap();
+        fs::write(a.with_extension("lrc"), "edited shared lyrics").unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, "replacement lyrics").unwrap();
+        fs::rename(replacement, a.with_extension("lrc")).unwrap();
+        // Force the ordering where a worker reindexes the replacement before the
+        // native dispatcher can expand the pending write event.
+        processor.process_directory(a.parent().unwrap()).unwrap();
+        assert!(
+            processor
+                .inner
+                .db
+                .file_version(&b.with_extension("lrc"))
+                .unwrap()
+                > version
+        );
+        assert!(
+            !processor.inner.queue.idle(),
+            "old alias must be admitted without its own event"
+        );
+        let work = processor.inner.queue.take().unwrap();
+        assert_eq!(work.directory, b.parent().unwrap());
+        processor.process_work(&work).unwrap();
+        processor.inner.queue.finish(work, false);
+        assert_eq!(
+            processor.inner.db.cached(&b, &tags()).unwrap(),
+            Some(CachedResult::Found {
+                lyrics: "edited shared lyrics".into(),
+                origin: Origin::Curated,
+            })
+        );
     }
 
     #[test]

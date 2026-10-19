@@ -1,39 +1,52 @@
 use std::{
-    sync::{Arc, mpsc},
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use notify::{
-    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
-    Watcher,
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind},
 };
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
 use crate::{
     config::{Config, WatchMode},
-    files,
+    db::CacheDb,
+    files::{self, FileStamp},
     queue::WorkQueue,
     shutdown::Shutdown,
 };
 
-pub fn start(config: Config, queue: Arc<WorkQueue>, shutdown: Shutdown) -> Result<JoinHandle<()>> {
+pub fn start(
+    config: Config,
+    db: CacheDb,
+    queue: Arc<WorkQueue>,
+    shutdown: Shutdown,
+) -> Result<JoinHandle<()>> {
+    if config.watch_mode == WatchMode::Poll {
+        return start_poll(config, queue, shutdown);
+    }
     let (tx, rx) = mpsc::sync_channel(256);
-    let overflow = queue.clone();
-    let callback = move |event| {
-        if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(event) {
-            overflow.request_repair();
-        }
-    };
+    let watch_lost = Arc::new(AtomicBool::new(false));
+    let callback = native_callback(
+        config.music_dir.clone(),
+        tx,
+        queue.clone(),
+        watch_lost.clone(),
+    );
     let options = NotifyConfig::default()
         .with_follow_symlinks(config.follow_symlinks)
         .with_poll_interval(config.poll_interval);
-    let mut watcher: Box<dyn Watcher + Send> = match config.watch_mode {
-        WatchMode::Poll => Box::new(PollWatcher::new(callback, options)?),
-        WatchMode::Native => Box::new(RecommendedWatcher::new(callback, options)?),
-    };
+    let mut watcher = RecommendedWatcher::new(callback, options)?;
     watcher
         .watch(&config.music_dir, RecursiveMode::Recursive)
         .with_context(|| format!("watching {}", config.music_dir.display()))?;
@@ -43,11 +56,54 @@ pub fn start(config: Config, queue: Arc<WorkQueue>, shutdown: Shutdown) -> Resul
         .spawn(move || {
             let _watcher = watcher;
             while !shutdown.is_cancelled() {
+                if watch_lost.load(Ordering::Relaxed) {
+                    // Persist invalidation before exiting: missed writes may have unchanged
+                    // stamps when a supervisor restarts us and reconciles the library.
+                    if let Err(err) = db.invalidate_all_snapshots() {
+                        warn!(error = %err, "content-cache invalidation failed after watch loss");
+                    }
+                    queue.request_repair();
+                    warn!("filesystem watch lost; restart required to restore native coverage");
+                    break;
+                }
                 match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Ok(event)) => dispatch(&config, &queue, event),
-                    Ok(Err(err)) => {
-                        warn!(error = %err, "filesystem event failed; requesting repair scan");
-                        queue.request_repair();
+                    Ok(mut event) => {
+                        if matches!(
+                            event.kind,
+                            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any)
+                                | EventKind::Any
+                                | EventKind::Access(AccessKind::Close(AccessMode::Write))
+                        ) {
+                            let invalidated = (|| -> Result<()> {
+                                let mut affected: BTreeSet<_> =
+                                    event.paths.iter().cloned().collect();
+                                for path in &event.paths {
+                                    if files::eligible(&config, path)
+                                        && (files::is_audio(path) || files::is_lrc(path))
+                                        && !path.is_dir()
+                                    {
+                                        affected.extend(db.paths_sharing_file(path)?);
+                                    }
+                                }
+                                let changed: Vec<_> = affected
+                                    .iter()
+                                    .filter(|path| {
+                                        files::eligible(&config, path)
+                                            && (files::is_audio(path) || files::is_lrc(path))
+                                            && !path.is_dir()
+                                    })
+                                    .cloned()
+                                    .collect();
+                                db.invalidate_files(&changed)?;
+                                event.paths = affected.into_iter().collect();
+                                Ok(())
+                            })();
+                            if let Err(err) = invalidated {
+                                warn!(error = %err, "content-cache invalidation failed");
+                                break;
+                            }
+                        }
+                        dispatch(&config, &queue, event);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -57,14 +113,136 @@ pub fn start(config: Config, queue: Arc<WorkQueue>, shutdown: Shutdown) -> Resul
         .context("starting watcher dispatcher")
 }
 
+fn native_callback(
+    root: PathBuf,
+    tx: mpsc::SyncSender<Event>,
+    queue: Arc<WorkQueue>,
+    watch_lost: Arc<AtomicBool>,
+) -> impl FnMut(notify::Result<Event>) {
+    move |event: notify::Result<Event>| {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                // Failed recursive registration can leave unwatched directories.
+                warn!(error = %err, "native backend failed; filesystem watch coverage lost");
+                watch_lost.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        if event.need_rescan() {
+            // Lost directory-create events can leave gaps in recursive watch coverage.
+            // This signal must survive a full application channel too.
+            warn!("native event overflow; filesystem watch coverage lost");
+            watch_lost.store(true, Ordering::Relaxed);
+            return;
+        }
+        if event.paths.iter().any(|path| path == &root)
+            && matches!(
+                event.kind,
+                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+            )
+        {
+            // Watch loss must survive a full change channel.
+            watch_lost.store(true, Ordering::Relaxed);
+            return;
+        }
+        // Readers generate native access events too; they must not fill the change channel.
+        if !is_change(&event) {
+            return;
+        }
+        if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(event) {
+            queue.request_repair();
+        }
+    }
+}
+
+fn metadata_snapshot(config: &Config) -> Result<BTreeMap<PathBuf, FileStamp>> {
+    let mut snapshot = BTreeMap::new();
+    for entry in WalkDir::new(&config.music_dir)
+        .follow_links(config.follow_symlinks)
+        .into_iter()
+        .filter_entry(|entry| files::eligible(config, entry.path()))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err)
+                if err
+                    .io_error()
+                    .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let path = entry.path();
+        if (files::is_audio(path) || files::is_lrc(path)) && path.is_file() {
+            match FileStamp::read(path) {
+                Ok(stamp) => {
+                    snapshot.insert(path.to_owned(), stamp);
+                }
+                Err(err) if !path.exists() => {
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
+fn start_poll(config: Config, queue: Arc<WorkQueue>, shutdown: Shutdown) -> Result<JoinHandle<()>> {
+    let mut previous = metadata_snapshot(&config)?;
+    info!(mode = ?config.watch_mode, path = %config.music_dir.display(), "started filesystem watcher");
+    thread::Builder::new()
+        .name("lrc-sync-poll-watcher".into())
+        .spawn(move || {
+            while shutdown.wait(config.poll_interval) {
+                let current = match metadata_snapshot(&config) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        warn!(error = %err, "metadata polling failed");
+                        break;
+                    }
+                };
+                for (path, stamp) in &current {
+                    if previous.get(path) != Some(stamp) {
+                        dispatch(
+                            &config,
+                            &queue,
+                            Event::new(EventKind::Create(CreateKind::File)).add_path(path.clone()),
+                        );
+                    }
+                }
+                for path in previous.keys().filter(|path| !current.contains_key(*path)) {
+                    dispatch(
+                        &config,
+                        &queue,
+                        Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.clone()),
+                    );
+                }
+                previous = current;
+            }
+        })
+        .context("starting metadata polling")
+}
+
+fn is_change(event: &Event) -> bool {
+    event.need_rescan()
+        || matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Modify(_)
+                | EventKind::Remove(_)
+                | EventKind::Any
+                | EventKind::Access(AccessKind::Close(AccessMode::Write))
+        )
+}
+
 fn dispatch(config: &Config, queue: &WorkQueue, event: Event) {
     if event.need_rescan() {
         queue.request_repair();
     }
-    if !matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
-    ) {
+    if !is_change(&event) {
         return;
     }
     for path in event.paths {
@@ -72,6 +250,10 @@ fn dispatch(config: &Config, queue: &WorkQueue, event: Event) {
             continue;
         }
         if path.is_dir() {
+            // Child changes have their own events. A directory timestamp is not a new subtree.
+            if matches!(event.kind, EventKind::Modify(ModifyKind::Metadata(_))) {
+                continue;
+            }
             // A renamed album can already contain tracks before the watcher sees its directory.
             for entry in WalkDir::new(&path)
                 .follow_links(config.follow_symlinks)
@@ -98,8 +280,67 @@ fn dispatch(config: &Config, queue: &WorkQueue, event: Event) {
 mod tests {
     use super::*;
     use crate::test_support::{config, tags, write_flac};
-    use notify::event::{CreateKind, RemoveKind};
+    use notify::event::{AccessKind, AccessMode, CreateKind, MetadataKind, RemoveKind};
     use tempfile::TempDir;
+
+    #[test]
+    fn watch_loss_signals_survive_a_saturated_change_channel() {
+        for cause in 0..3 {
+            let root = TempDir::new().unwrap();
+            let queue = Arc::new(WorkQueue::new(1, Shutdown::default()));
+            let lost = Arc::new(AtomicBool::new(false));
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let mut callback =
+                native_callback(root.path().to_owned(), tx, queue.clone(), lost.clone());
+            for name in ["first.flac", "second.flac"] {
+                callback(Ok(Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(root.path().join(name))));
+            }
+            assert!(
+                queue.take_repair_request(),
+                "fixture must fill the change channel"
+            );
+            assert!(
+                !lost.load(Ordering::Relaxed),
+                "ordinary queue pressure only needs content repair"
+            );
+            let failure = match cause {
+                0 => Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+                1 => Ok(Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+                _ => Ok(Event::new(EventKind::Remove(RemoveKind::Folder))
+                    .add_path(root.path().to_owned())),
+            };
+            callback(failure);
+            assert!(
+                lost.load(Ordering::Relaxed),
+                "watch loss must survive a full channel (cause {cause})"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_and_directory_timestamps_do_not_request_library_work() {
+        let root = TempDir::new().unwrap();
+        let settings = config(root.path());
+        let queue = WorkQueue::new(1, Shutdown::default());
+        let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(root.path().join("song.flac"));
+        assert!(!is_change(&read));
+        assert!(is_change(&Event::new(EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        ))));
+        dispatch(&settings, &queue, read);
+        dispatch(
+            &settings,
+            &queue,
+            Event::new(EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::WriteTime,
+            )))
+            .add_path(root.path().to_owned()),
+        );
+        assert!(queue.idle());
+        assert!(!queue.take_repair_request());
+    }
 
     #[test]
     fn lyric_removal_and_populated_directory_events_reach_the_queue() {
