@@ -80,8 +80,14 @@ fn run(mut config: Config, shutdown: Shutdown, lrclib: LrclibClient) -> Result<(
     }
     info!(?config, "starting lrc-sync");
     let db = CacheDb::open(config.db_file.clone(), config.retry_not_found_days)?;
-    let processor = Processor::new(config.clone(), db.clone(), lrclib, shutdown.clone());
     let queue = Arc::new(WorkQueue::new(config.max_pending_dirs, shutdown.clone()));
+    let processor = Processor::new(
+        config.clone(),
+        db.clone(),
+        lrclib,
+        shutdown.clone(),
+        queue.clone(),
+    );
     thread::scope(|scope| -> Result<()> {
         let _stop = StopOnDrop {
             queue: &queue,

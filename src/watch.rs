@@ -37,10 +37,17 @@ pub fn start(
     }
     let (tx, rx) = mpsc::sync_channel(256);
     let overflow = queue.clone();
-    let root_lost = Arc::new(AtomicBool::new(false));
-    let callback_root_lost = root_lost.clone();
+    let watch_lost = Arc::new(AtomicBool::new(false));
+    let callback_watch_lost = watch_lost.clone();
     let root = config.music_dir.clone();
     let callback = move |event: notify::Result<Event>| {
+        if event.as_ref().is_ok_and(Event::need_rescan) {
+            // Lost directory-create events can leave gaps in recursive watch coverage.
+            // This signal must survive a full application channel too.
+            warn!("native event overflow; filesystem watch coverage lost");
+            callback_watch_lost.store(true, Ordering::Relaxed);
+            return;
+        }
         if event.as_ref().is_ok_and(|event| {
             event.paths.iter().any(|path| path == &root)
                 && matches!(
@@ -49,7 +56,7 @@ pub fn start(
                 )
         }) {
             // Watch loss must survive a full change channel.
-            callback_root_lost.store(true, Ordering::Relaxed);
+            callback_watch_lost.store(true, Ordering::Relaxed);
             return;
         }
         // Readers generate native access events too; they must not fill the change channel.
@@ -73,8 +80,14 @@ pub fn start(
         .spawn(move || {
             let _watcher = watcher;
             while !shutdown.is_cancelled() {
-                if root_lost.load(Ordering::Relaxed) {
-                    warn!("music root removed or renamed; filesystem watch lost");
+                if watch_lost.load(Ordering::Relaxed) {
+                    // Persist invalidation before exiting: missed writes may have unchanged
+                    // stamps when a supervisor restarts us and reconciles the library.
+                    if let Err(err) = db.invalidate_all_snapshots() {
+                        warn!(error = %err, "content-cache invalidation failed after watch loss");
+                    }
+                    queue.request_repair();
+                    warn!("filesystem watch lost; restart required to restore native coverage");
                     break;
                 }
                 match rx.recv_timeout(Duration::from_millis(100)) {

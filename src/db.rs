@@ -111,14 +111,19 @@ impl CacheDb {
     pub fn invalidate_files(&self, paths: &[PathBuf]) -> Result<()> {
         let mut conn = self.conn.lock().expect("cache lock poisoned");
         let tx = conn.transaction()?;
+        Self::invalidate_paths(&tx, paths)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn invalidate_paths(conn: &Connection, paths: &[PathBuf]) -> Result<()> {
         for path in paths {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO file_versions(path,version) VALUES(?1,1)
                  ON CONFLICT(path) DO UPDATE SET version=version+1",
                 [path.as_os_str().as_encoded_bytes()],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -147,24 +152,19 @@ impl CacheDb {
                 .ok()
                 .and_then(|stamp| stamp.identity());
             let conn = self.conn.lock().expect("cache lock poisoned");
-            let identity = match current {
-                Some(identity) => Some(identity.to_vec()),
-                None => conn
-                    .query_row(
-                        "SELECT identity FROM file_identities WHERE path=?1",
-                        [path.as_os_str().as_encoded_bytes()],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?,
-            };
-            let Some(identity) = identity else {
-                return Ok(Vec::new());
-            };
-            let mut query = conn.prepare("SELECT path FROM file_identities WHERE identity=?1")?;
+            // An atomic replacement may follow a write to the recorded inode.
+            let mut query = conn.prepare(
+                "SELECT path FROM file_identities WHERE identity=?1 OR identity=(
+                    SELECT identity FROM file_identities WHERE path=?2)",
+            )?;
             Ok(query
-                .query_map([identity], |row| {
-                    Ok(PathBuf::from(OsString::from_vec(row.get(0)?)))
-                })?
+                .query_map(
+                    params![
+                        current.as_ref().map(|id| id.as_slice()),
+                        path.as_os_str().as_encoded_bytes()
+                    ],
+                    |row| Ok(PathBuf::from(OsString::from_vec(row.get(0)?))),
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         }
         #[cfg(not(unix))]
@@ -174,8 +174,29 @@ impl CacheDb {
         }
     }
 
-    fn index_file(conn: &Connection, path: &Path, stamp: &FileStamp) -> Result<()> {
+    fn index_file(conn: &Connection, path: &Path, stamp: &FileStamp) -> Result<Vec<PathBuf>> {
+        #[cfg(unix)]
+        let mut displaced = Vec::new();
+        #[cfg(not(unix))]
+        let displaced = Vec::new();
         if let Some(identity) = stamp.identity() {
+            #[cfg(unix)]
+            {
+                use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+                // A worker can beat the write dispatcher to a replaced path. Transfer
+                // its old aliases before overwriting the only indexed identity.
+                let mut query = conn.prepare(
+                    "SELECT path FROM file_identities WHERE path!=?1 AND identity!=?2
+                     AND identity=(SELECT identity FROM file_identities WHERE path=?1)",
+                )?;
+                displaced = query
+                    .query_map(
+                        params![path.as_os_str().as_encoded_bytes(), identity.as_slice()],
+                        |row| Ok(PathBuf::from(OsString::from_vec(row.get(0)?))),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Self::invalidate_paths(conn, &displaced)?;
+            }
             conn.execute(
                 "INSERT INTO file_identities(path,identity) VALUES(?1,?2)
                 ON CONFLICT(path) DO UPDATE SET identity=excluded.identity
@@ -183,7 +204,7 @@ impl CacheDb {
                 params![path.as_os_str().as_encoded_bytes(), identity.as_slice()],
             )?;
         }
-        Ok(())
+        Ok(displaced)
     }
 
     pub fn cached_tags(
@@ -219,9 +240,9 @@ impl CacheDb {
         stamp: &FileStamp,
         version: i64,
         tags: &TrackTags,
-    ) -> Result<()> {
+    ) -> Result<Vec<PathBuf>> {
         if !cfg!(unix) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let fingerprint = serde_json::to_vec(&(stamp, version))?;
         let mut conn = self.conn.lock().expect("cache lock poisoned");
@@ -232,9 +253,9 @@ impl CacheDb {
                  title=excluded.title,album=excluded.album,duration=excluded.duration",
             params![path.as_os_str().as_encoded_bytes(), fingerprint, tags.artist, tags.title, tags.album, tags.duration_secs],
         )?;
-        Self::index_file(&tx, path, stamp)?;
+        let displaced = Self::index_file(&tx, path, stamp)?;
         tx.commit()?;
-        Ok(())
+        Ok(displaced)
     }
 
     pub fn cached_lyric_file(
@@ -263,9 +284,9 @@ impl CacheDb {
         stamp: &FileStamp,
         version: i64,
         lyrics: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<PathBuf>> {
         if !cfg!(unix) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let fingerprint = serde_json::to_vec(&(stamp, version))?;
         let mut conn = self.conn.lock().expect("cache lock poisoned");
@@ -275,9 +296,9 @@ impl CacheDb {
              ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,lyrics=excluded.lyrics",
             params![path.as_os_str().as_encoded_bytes(), fingerprint, lyrics],
         )?;
-        Self::index_file(&tx, path, stamp)?;
+        let displaced = Self::index_file(&tx, path, stamp)?;
         tx.commit()?;
-        Ok(())
+        Ok(displaced)
     }
 
     pub fn record(&self, path: &Path) -> Result<Option<TrackRecord>> {
@@ -475,6 +496,32 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = CacheDb::open(dir.path().join("cache.sqlite3"), 7).unwrap();
         (dir, db)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_alias_lookup_includes_recorded_and_replacement_inodes() {
+        let (directory, cache) = db();
+        let a = directory.path().join("a.lrc");
+        let b = directory.path().join("b.lrc");
+        let c = directory.path().join("c.lrc");
+        fs::write(&a, "old inode").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        fs::write(&c, "new inode").unwrap();
+        for path in [&a, &b, &c] {
+            cache
+                .store_lyric_file(path, &FileStamp::read(path).unwrap(), 0, "cached")
+                .unwrap();
+        }
+        fs::remove_file(&a).unwrap();
+        fs::hard_link(&c, &a).unwrap();
+        let mut aliases = cache.paths_sharing_file(&a).unwrap();
+        aliases.sort();
+        assert_eq!(aliases, vec![a.clone(), b.clone(), c]);
+        fs::remove_file(&a).unwrap();
+        let mut aliases = cache.paths_sharing_file(&a).unwrap();
+        aliases.sort();
+        assert_eq!(aliases, vec![a, b]);
     }
 
     #[cfg(unix)]

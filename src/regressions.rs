@@ -26,7 +26,8 @@ fn processor(config: &Config, server: &TestServer) -> Processor {
         config.clone(),
         CacheDb::open(config.db_file.clone(), 7).unwrap(),
         LrclibClient::test_client(server.url.clone(), shutdown.clone()),
-        shutdown,
+        shutdown.clone(),
+        Arc::new(WorkQueue::new(config.max_pending_dirs, shutdown)),
     )
 }
 

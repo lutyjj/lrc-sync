@@ -40,6 +40,7 @@ struct ProcessorInner {
     db: CacheDb,
     lrclib: LrclibClient,
     shutdown: Shutdown,
+    queue: Arc<WorkQueue>,
 }
 
 struct Audio {
@@ -52,13 +53,20 @@ struct Audio {
 }
 
 impl Processor {
-    pub fn new(config: Config, db: CacheDb, lrclib: LrclibClient, shutdown: Shutdown) -> Self {
+    pub fn new(
+        config: Config,
+        db: CacheDb,
+        lrclib: LrclibClient,
+        shutdown: Shutdown,
+        queue: Arc<WorkQueue>,
+    ) -> Self {
         Self {
             inner: Arc::new(ProcessorInner {
                 config,
                 db,
                 lrclib,
                 shutdown,
+                queue,
             }),
         }
     }
@@ -83,6 +91,7 @@ impl Processor {
             self.inner.db.clone(),
             self.inner.lrclib.clone(),
             self.inner.shutdown.clone(),
+            self.inner.queue.clone(),
         )
         .process_directory(work.physical_directory())?;
         Ok(if changed {
@@ -355,9 +364,11 @@ impl Processor {
             return Ok(None);
         }
         if cached.is_none() {
-            self.inner
+            let displaced = self
+                .inner
                 .db
                 .store_tags(&physical, &stamp, version, &tags)?;
+            self.queue_displaced(displaced);
         }
         Ok(Some(Audio {
             path: path.to_owned(),
@@ -388,11 +399,21 @@ impl Processor {
             bail!("sidecar changed while reading {}", path.display());
         }
         if cached.is_none() {
-            self.inner
+            let displaced = self
+                .inner
                 .db
                 .store_lyric_file(&physical, &stamp, version, &lyrics)?;
+            self.queue_displaced(displaced);
         }
         Ok(lyrics)
+    }
+
+    fn queue_displaced(&self, paths: Vec<PathBuf>) {
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                self.inner.queue.submit(parent.to_owned(), false);
+            }
+        }
     }
 
     fn reconcile(
@@ -588,11 +609,68 @@ mod tests {
         let db = CacheDb::open(config.db_file.clone(), config.retry_not_found_days).unwrap();
         let shutdown = Shutdown::default();
         Processor::new(
-            config,
+            config.clone(),
             db,
             LrclibClient::test_client(server.url.clone(), shutdown.clone()),
-            shutdown,
+            shutdown.clone(),
+            Arc::new(WorkQueue::new(config.max_pending_dirs, shutdown)),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_before_write_dispatch_transfers_the_displaced_hardlink_work() {
+        let root = TempDir::new().unwrap();
+        let a = root.path().join("a/song.flac");
+        let b = root.path().join("b/song.flac");
+        for audio in [&a, &b] {
+            write_flac(audio, &tags());
+        }
+        fs::write(a.with_extension("lrc"), "original lyrics").unwrap();
+        fs::hard_link(a.with_extension("lrc"), b.with_extension("lrc")).unwrap();
+        let server = TestServer::new(|_| panic!("curated sidecars never require HTTP"));
+        let processor = processor(config(root.path()), &server);
+        for audio in [&a, &b] {
+            processor
+                .process_directory(audio.parent().unwrap())
+                .unwrap();
+        }
+        assert!(processor.inner.queue.idle());
+        let version = processor
+            .inner
+            .db
+            .file_version(&b.with_extension("lrc"))
+            .unwrap();
+        fs::write(a.with_extension("lrc"), "edited shared lyrics").unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, "replacement lyrics").unwrap();
+        fs::rename(replacement, a.with_extension("lrc")).unwrap();
+        // Force the ordering where a worker reindexes the replacement before the
+        // native dispatcher can expand the pending write event.
+        processor.process_directory(a.parent().unwrap()).unwrap();
+        assert!(
+            processor
+                .inner
+                .db
+                .file_version(&b.with_extension("lrc"))
+                .unwrap()
+                > version
+        );
+        assert!(
+            !processor.inner.queue.idle(),
+            "old alias must be admitted without its own event"
+        );
+        let work = processor.inner.queue.take().unwrap();
+        assert_eq!(work.directory, b.parent().unwrap());
+        processor.process_work(&work).unwrap();
+        processor.inner.queue.finish(work, false);
+        assert_eq!(
+            processor.inner.db.cached(&b, &tags()).unwrap(),
+            Some(CachedResult::Found {
+                lyrics: "edited shared lyrics".into(),
+                origin: Origin::Curated,
+            })
+        );
     }
 
     #[test]

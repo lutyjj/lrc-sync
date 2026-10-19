@@ -14,6 +14,191 @@ use tempfile::TempDir;
 
 struct Daemon(Child);
 
+impl Daemon {
+    fn signal(&self, signal: &str) {
+        assert!(
+            Command::new("/bin/kill")
+                .args([signal, &self.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        if signal == "-STOP" {
+            wait_until(|| {
+                fs::read_to_string(format!("/proc/{}/status", self.0.id()))
+                    .unwrap()
+                    .lines()
+                    .any(|line| line.starts_with("State:\tT"))
+            });
+        }
+    }
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !predicate() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not reach expected state"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn lyrics_at(cache: &Path, audio: &Path) -> Option<String> {
+    rusqlite::Connection::open_with_flags(cache, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()?
+        .query_row(
+            "SELECT lyrics FROM tracks WHERE path=?1 AND origin='curated'",
+            [audio.as_os_str().as_encoded_bytes()],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn spawn_native(library: &Path, cache: &Path, log: &Path) -> Daemon {
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
+            .env_clear()
+            .env("LRCSYNC_MUSIC_DIR", library)
+            .env("LRCSYNC_DB_PATH", cache)
+            .env("LRCSYNC_WATCH_MODE", "native")
+            .env("LRCSYNC_FALLBACK_SCAN_SECONDS", "0")
+            .stdout(Stdio::from(fs::File::create(log).unwrap()))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until(|| {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("started filesystem watcher")
+    });
+    daemon
+}
+
+#[test]
+fn atomic_replacement_keeps_the_modified_old_hardlink_live_without_library_repair() {
+    let library = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let a = library.path().join("a/song.mp3");
+    let b = library.path().join("b/song.mp3");
+    for audio in [&a, &b] {
+        fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/whitespace-artist.mp3"
+            ),
+            audio,
+        )
+        .unwrap();
+    }
+    fs::write(a.with_extension("lrc"), "original lyrics").unwrap();
+    fs::hard_link(a.with_extension("lrc"), b.with_extension("lrc")).unwrap();
+    let cache = state.path().join("cache.sqlite3");
+    let daemon = spawn_native(library.path(), &cache, &state.path().join("daemon.log"));
+    wait_until(|| {
+        lyrics_at(&cache, &a).as_deref() == Some("original lyrics")
+            && lyrics_at(&cache, &b).as_deref() == Some("original lyrics")
+    });
+    daemon.signal("-STOP");
+    fs::write(a.with_extension("lrc"), "edited shared lyrics").unwrap();
+    let replacement = state.path().join("replacement.lrc");
+    fs::write(&replacement, "replacement lyrics").unwrap();
+    fs::rename(&replacement, a.with_extension("lrc")).unwrap();
+    daemon.signal("-CONT");
+    wait_until(|| {
+        lyrics_at(&cache, &b).as_deref() == Some("edited shared lyrics")
+            && lyrics_at(&cache, &a).as_deref() == Some("replacement lyrics")
+    });
+    let conn = rusqlite::Connection::open(&cache).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM file_versions WHERE path=X''",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn kernel_overflow_exits_and_restart_watches_the_lost_directory() {
+    let library = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let cache = state.path().join("cache.sqlite3");
+    let log = state.path().join("daemon.log");
+    let mut daemon = spawn_native(library.path(), &cache, &log);
+    daemon.signal("-STOP");
+    let limit: usize = fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        limit <= 16_777_216,
+        "inotify queue too large for bounded overflow fixture"
+    );
+    let noise = library.path().join("noise");
+    fs::File::create(&noise).unwrap();
+    // Alternating open/close events cannot coalesce, and reuse one inode even on
+    // systems configured with a large kernel queue.
+    for _ in 0..=limit / 2 {
+        fs::OpenOptions::new().write(true).open(&noise).unwrap();
+    }
+    // These create events fall after the full kernel queue, so no recursive watch is installed.
+    let lost = library.path().join("lost");
+    fs::create_dir(&lost).unwrap();
+    let audio = lost.join("song.mp3");
+    fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/whitespace-artist.mp3"
+        ),
+        &audio,
+    )
+    .unwrap();
+    fs::write(audio.with_extension("lrc"), "lost directory lyrics").unwrap();
+    daemon.signal("-CONT");
+    // Large administrator-configured queues take longer to drain through notify.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            assert!(!status.success(), "native overflow must fail the daemon");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "overflow did not stop daemon: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .contains("native event overflow")
+    );
+    let conn = rusqlite::Connection::open(&cache).unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT version FROM file_versions WHERE path=X''",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap()
+            > 0
+    );
+    drop(daemon);
+    let _restarted = spawn_native(library.path(), &cache, &log);
+    wait_until(|| lyrics_at(&cache, &audio).as_deref() == Some("lost directory lyrics"));
+    fs::write(audio.with_extension("lrc"), "later edited lyrics").unwrap();
+    wait_until(|| lyrics_at(&cache, &audio).as_deref() == Some("later edited lyrics"));
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -84,9 +269,11 @@ fn unchanged_audio_is_not_opened(mode: &str, idle: Duration) {
         assert!(Instant::now() < deadline, "watcher did not start");
         thread::sleep(Duration::from_millis(10));
     }
+    let event = rx.recv_timeout(idle);
     assert!(
-        rx.recv_timeout(idle).is_err(),
-        "idle {mode} mode opened unchanged audio"
+        event.is_err(),
+        "idle {mode} mode opened unchanged audio: {event:?}; {}",
+        fs::read_to_string(&log).unwrap()
     );
     let staging = TempDir::new().unwrap();
     fs::copy(
