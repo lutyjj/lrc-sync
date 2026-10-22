@@ -17,8 +17,14 @@ struct Daemon(Child);
 impl Daemon {
     fn signal(&self, signal: &str) {
         assert!(
-            Command::new("/bin/kill")
-                .args([signal, &self.0.id().to_string()])
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "kill \"$1\" \"$2\"",
+                    "lrc-sync-signal-test",
+                    signal,
+                    &self.0.id().to_string(),
+                ])
                 .status()
                 .unwrap()
                 .success()
@@ -60,6 +66,8 @@ fn spawn_native(library: &Path, cache: &Path, log: &Path) -> Daemon {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
             .env_clear()
+            // Without a system store (the Nix build sandbox) the HTTP client needs the CA bundle.
+            .envs(std::env::var_os("SSL_CERT_FILE").map(|path| ("SSL_CERT_FILE", path)))
             .env("LRCSYNC_MUSIC_DIR", library)
             .env("LRCSYNC_DB_PATH", cache)
             .env("LRCSYNC_WATCH_MODE", "native")
@@ -249,6 +257,8 @@ fn unchanged_audio_is_not_opened(mode: &str, idle: Duration) {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
             .env_clear()
+            // Without a system store (the Nix build sandbox) the HTTP client needs the CA bundle.
+            .envs(std::env::var_os("SSL_CERT_FILE").map(|path| ("SSL_CERT_FILE", path)))
             .env("LRCSYNC_MUSIC_DIR", library.path())
             .env("LRCSYNC_DB_PATH", state.path().join("cache.sqlite3"))
             .env("LRCSYNC_WATCH_MODE", mode)
@@ -340,6 +350,8 @@ fn startup_reconciliation_reuses_file_cache_without_reopening_unchanged_files() 
         let mut daemon = Daemon(
             Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
                 .env_clear()
+                // Without a system store (the Nix build sandbox) the HTTP client needs the CA bundle.
+                .envs(std::env::var_os("SSL_CERT_FILE").map(|path| ("SSL_CERT_FILE", path)))
                 .env("LRCSYNC_MUSIC_DIR", library.path())
                 .env("LRCSYNC_DB_PATH", &cache)
                 .stdout(Stdio::from(fs::File::create(&log).unwrap()))
@@ -404,6 +416,8 @@ fn losing_the_native_root_exits_and_restart_watches_the_replacement() {
             Daemon(
                 Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
                     .env_clear()
+                    // Without a system store (the Nix build sandbox) the HTTP client needs the CA bundle.
+                    .envs(std::env::var_os("SSL_CERT_FILE").map(|path| ("SSL_CERT_FILE", path)))
                     .env("LRCSYNC_MUSIC_DIR", &library)
                     .env("LRCSYNC_DB_PATH", &cache)
                     .env("LRCSYNC_WATCH_MODE", "native")
@@ -563,6 +577,8 @@ fn check_write_close(hardlinked: bool) {
     let _daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
             .env_clear()
+            // Without a system store (the Nix build sandbox) the HTTP client needs the CA bundle.
+            .envs(std::env::var_os("SSL_CERT_FILE").map(|path| ("SSL_CERT_FILE", path)))
             .env("LRCSYNC_MUSIC_DIR", library.path())
             .env("LRCSYNC_DB_PATH", &cache)
             .env("LRCSYNC_WATCH_MODE", "native")

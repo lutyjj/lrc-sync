@@ -20,7 +20,7 @@ docker compose up -d --build
 
 Those two variables configure host mounts. The process inside the container reads `/music` and stores its cache at `/config/cache.sqlite3`.
 
-For a native run with Rust 1.99 or later:
+For a native run with Rust 1.95 or later:
 
 ```sh
 cargo build --release --locked
@@ -28,6 +28,37 @@ LRCSYNC_MUSIC_DIR=/path/to/music \
 LRCSYNC_DB_PATH=/path/to/cache.sqlite3 \
 ./target/release/lrc-sync
 ```
+
+### NixOS
+
+The flake provides the package for x86_64 and aarch64 Linux and a NixOS module. Add it as an input and import the module:
+
+```nix
+{
+  inputs.lrc-sync = {
+    url = "github:lutyjj/lrc-sync";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { nixpkgs, lrc-sync, ... }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      modules = [
+        lrc-sync.nixosModules.default
+        {
+          services.lrc-sync = {
+            enable = true;
+            musicDir = "/srv/music";
+            group = "media";
+            settings.LRCSYNC_WATCH_MODE = "poll";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The service runs as `user` and `group` (both `lrc-sync` by default; the module creates them only at that default) and needs write access to `musicDir`. Its cache is `/var/lib/lrc-sync/cache.sqlite3`. `settings` takes the `LRCSYNC_*` variables from [Configuration](#configuration); the module sets `LRCSYNC_MUSIC_DIR` and `LRCSYNC_DB_PATH`. Systemd restarts the service on failure and allows the request timeout plus 15 seconds for shutdown.
 
 ## Matching and cache
 
@@ -98,11 +129,12 @@ Reconciliation and quarantine use atomic moves without replacing an existing des
 make verify   # Formatting, strict Clippy, and behavioral tests
 make build    # Locked container build, including tests
 make update   # Resolve the latest allowed crate versions and verify
+nix flake check   # Package build with tests, and a NixOS VM test (needs KVM)
 ```
 
 Tests use temporary libraries, synthetic metadata, and a loopback HTTP server. They cover lookup ambiguity, cache corrections, publication races, orphan handling, native and polling watchers, queue bounds, and shutdown.
 
-CI verifies code with the latest stable Rust toolchain and builds the container. Daily Dependabot checks propose crate, Docker image, and GitHub Actions updates. These proposals require review and merge; they do not update a running service.
+CI verifies code with the latest stable Rust toolchain and builds the container. Daily Dependabot checks propose crate, Docker image, and GitHub Actions updates. These proposals require review and merge; they do not update a running service. CI does not run the Nix checks, and Dependabot does not update `flake.lock`; run `nix flake update` for that.
 
 ## License
 
