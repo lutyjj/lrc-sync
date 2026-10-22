@@ -134,7 +134,7 @@ nix flake check   # Package build with tests, and a NixOS VM test (needs KVM)
 
 Tests use temporary libraries, synthetic metadata, and a loopback HTTP server. They cover lookup ambiguity, cache corrections, publication races, orphan handling, native and polling watchers, queue bounds, and shutdown.
 
-CI verifies code with the latest stable Rust toolchain and builds the container. Daily Dependabot checks propose crate, Docker image, and GitHub Actions updates. These proposals require review and merge; they do not update a running service. CI does not run the Nix checks, and Dependabot does not update `flake.lock`; run `nix flake update` for that.
+CI verifies code with the latest stable Rust toolchain and builds the container. Daily Dependabot checks propose crate, Docker image, and GitHub Actions updates. These proposals require review and merge; they do not update a running service. CI also runs `nix flake check` on x86_64 Linux, which tests with the Rust release that nixpkgs provides. Dependabot does not update `flake.lock`; run `nix flake update` for that.
 
 ## License
 

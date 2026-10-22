@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::{
     fs,
     process::{Command, Stdio},
@@ -14,10 +16,7 @@ fn sigterm_exits_successfully_after_joining_workers() {
     let cache = library.path().join("cache.sqlite3");
     let log_path = library.path().join("daemon.log");
     let output = fs::File::create(&log_path).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lrc-sync"))
-        .env_clear()
-        // Without a system store (the Nix build sandbox) the HTTP client needs the CA bundle.
-        .envs(std::env::var_os("SSL_CERT_FILE").map(|path| ("SSL_CERT_FILE", path)))
+    let mut child = common::daemon()
         .env("LRCSYNC_MUSIC_DIR", library.path())
         .env("LRCSYNC_DB_PATH", &cache)
         .env("LRCSYNC_WATCH_MODE", "native")

@@ -112,7 +112,8 @@ in
         User = cfg.user;
         Group = cfg.group;
         StateDirectory = "lrc-sync";
-        # New sidecars stay writable by the library's group.
+        # Quarantine directories stay writable by the library's group; sidecars
+        # get their own fixed mode.
         UMask = "0002";
         # The watcher exits on failure; a restart rebuilds its coverage.
         Restart = "on-failure";

@@ -21,28 +21,39 @@
 
       overlays.default = final: _: { lrc-sync = final.callPackage ./nix/package.nix { }; };
 
-      nixosModules.default = {
-        imports = [ ./nix/module.nix ];
-        nixpkgs.overlays = [ self.overlays.default ];
-      };
+      # Defaults the package rather than adding the overlay, which read-only
+      # pkgs (nixpkgs.pkgs, runNixOSTest) would reject.
+      nixosModules.default =
+        { lib, pkgs, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.lrc-sync.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
 
       checks = forAllSystems (pkgs: {
-        package = self.packages.${pkgs.system}.default;
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         module = pkgs.testers.runNixOSTest {
           name = "lrc-sync";
           nodes.machine = {
             imports = [ self.nixosModules.default ];
-            systemd.tmpfiles.rules = [ "d /srv/music 0775 root users -" ];
+            # An unmatched sidecar exercises a write under the service's sandbox.
+            systemd.tmpfiles.rules = [
+              "d /srv/music 0775 root users -"
+              "f /srv/music/orphan.lrc 0664 root users - [00:01.00] orphan"
+            ];
             services.lrc-sync = {
               enable = true;
               musicDir = "/srv/music";
               group = "users";
+              settings.LRCSYNC_ORPHAN_ACTION = "quarantine";
             };
           };
           testScript = ''
             machine.wait_for_unit("lrc-sync.service")
-            machine.wait_until_succeeds("journalctl -u lrc-sync | grep -q 'initial library scan queued'")
+            machine.wait_until_succeeds("test -f /srv/music/.lrcsync-orphans/orphan.lrc")
+            machine.succeed("test ! -e /srv/music/orphan.lrc")
             machine.succeed("test -f /var/lib/lrc-sync/cache.sqlite3")
+            machine.succeed("systemctl is-active lrc-sync")
             machine.succeed("systemctl stop lrc-sync")
             machine.succeed("systemctl show -p Result --value lrc-sync | grep -qx success")
           '';

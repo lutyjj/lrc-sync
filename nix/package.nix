@@ -1,7 +1,6 @@
 {
   lib,
   rustPlatform,
-  cmake,
   cacert,
 }:
 let
@@ -22,10 +21,6 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ../Cargo.lock;
-
-  # aws-lc-sys, reqwest's rustls crypto provider, builds with CMake.
-  nativeBuildInputs = [ cmake ];
-  dontUseCmakeConfigure = true;
 
   # The HTTP client loads the system CA store when built, tests included.
   nativeCheckInputs = [ cacert ];
