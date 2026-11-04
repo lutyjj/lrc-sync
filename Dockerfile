@@ -1,9 +1,5 @@
 FROM rust:1.99-trixie@sha256:4c4c8ec55be09785e6d6ac45ea9853525a73c15db74009100ac08952e773dfb8 AS builder
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
