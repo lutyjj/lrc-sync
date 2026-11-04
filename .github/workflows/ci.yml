@@ -31,11 +31,12 @@ jobs:
           persist-credentials: false
       - name: Install the Rust toolchain named by rust-version
         run: |
-          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg manifest "$PWD/Cargo.toml" '.packages[] | select(.manifest_path == $manifest) | .rust_version')
           rustup toolchain install "$msrv" --profile minimal
           rustup default "$msrv"
-      - name: Check
-        run: make check
+      - name: Test
+        run: make test
 
   nix:
     runs-on: ubuntu-latest
