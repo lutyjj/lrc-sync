@@ -1,14 +1,42 @@
 version: 2
+
+# Every version update lands in one weekly pull request. When newer versions
+# appear before it merges, Dependabot replaces it with a refreshed one.
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+
 updates:
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: daily
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: daily
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    # Refresh transitive crates in Cargo.lock too, not only direct ones.
+    allow:
+      - dependency-type: all
+    # Third-party releases wait a week, long enough for a broken or
+    # compromised release to be noticed and yanked.
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: daily
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker
+    directory: /
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+
+  # Tracks the nixos channel in flake.nix, including moves to a newer release.
+  - package-ecosystem: nix
+    directory: /
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]

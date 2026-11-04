@@ -1,8 +1,4 @@
-FROM rust:1.99-trixie@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c27b541a6238a181 AS builder
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake \
-    && rm -rf /var/lib/apt/lists/*
+FROM rust:1.99-trixie@sha256:4c4c8ec55be09785e6d6ac45ea9853525a73c15db74009100ac08952e773dfb8 AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -15,7 +11,7 @@ RUN cargo test --locked
 FROM test AS release
 RUN cargo build --release --locked
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
