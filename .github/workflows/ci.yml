@@ -23,6 +23,20 @@ jobs:
       - name: Build and test the container
         run: make build
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain named by rust-version
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+      - name: Check
+        run: make check
+
   nix:
     runs-on: ubuntu-latest
     steps:
